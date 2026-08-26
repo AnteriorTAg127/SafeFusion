@@ -162,9 +162,7 @@ class TestMainNoTorch:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ) -> None:
-        manifest = _write_manifest(
-            tmp_path / "m.jsonl", [{"pool": "black", "text": "甲"}]
-        )
+        manifest = _write_manifest(tmp_path / "m.jsonl", [{"pool": "black", "text": "甲"}])
 
         def _boom(model: str | None, device: str) -> None:
             raise RuntimeError("torch 未安装")

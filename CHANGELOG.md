@@ -2,6 +2,22 @@
 
 本文件记录 SafeFusion 面向用户的版本变更（[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本）。内部开发日志见 `开发/changelog.md`（不入库）；真实数据不在本仓库分发，见 README「数据资产」。
 
+## [0.2.1] - 2026-08-27
+
+### Added
+
+- **前端管理面板**：Vue3 + Vite + TypeScript 独立 Web 工程（`web/`），八个视图——登录（X-Admin-Token）/ 概览（统计卡 + ECharts 7 天趋势）/ 审核记录（筛选 + detail 展开）/ 词库 / 白名单 / 规则 / 复核 / 设置；仅参考 AstrBot dashboard 的**设计规则**（分区 tab、统计卡片、表格分页、二次确认、Toast、防 XSS），零 AstrBot 依赖
+- **配置全量可自定义**：管理端 `GET/PUT /admin/config`（11 个配置分组在线读写）；`data/config_overrides.json` 覆盖层（优先级：内置默认 < config.yaml < 覆盖层 < 环境变量，**重启生效**）；密钥类字段一律遮蔽（只返回环境变量名 + 已配置布尔，值不可编辑）
+- **`semantic.fuse_mode` 运行时接线**：图文融合模式（pool/concat/weighted_avg）不再需要改代码；`backend=cloud` 且 `weighted_avg/pool` 时 422 校验并建议 `concat`（在线维度 ≠ 本地 CLIP 512）
+- **前端静态托管**：`web/dist` 存在时由管理服务（:8001）mount，同源免 CORS；开发模式 `npm run dev`（/admin 代理到 :8001）
+- **测试**：487 个 pytest 用例（+34 配置层，零回归）、ruff 全绿、人工第三轮 12/12 PASS（静态托管/鉴权/遮蔽/校验/恢复默认/覆盖层落盘/重启生效闭环）
+
+### Notes
+
+- **本地向量库构建验证（黑白各 1000 条）与在线 embedding 联调按用户决策顺延 v0.2.2** 一并执行；本期仅打通「配置可自定义」路径（`build_vector_db.py` 与双后端早已就绪，随时可跑）
+- 前端概览「降级组件数」卡与部分统计为近似口径（管理侧无 /health 等价端点，见 `开发/v0.2.1/` 记录）
+- ECharts 当前整包打进概览懒加载 chunk（约 1MB），后续可按需引入优化
+
 ## [0.2.0] - 2026-08-26
 
 ### Added

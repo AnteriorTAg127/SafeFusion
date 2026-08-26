@@ -1,0 +1,25 @@
+{
+  "name": "safefusion-web",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "SafeFusion 多模态内容审核系统 - 前端管理面板（Vue3 + Vite + TS）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0",
+    "pinia": "^3.0.1",
+    "axios": "^1.7.9",
+    "echarts": "^5.6.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.7",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.6.3",
+    "vue-tsc": "^2.1.10"
+  }
+}

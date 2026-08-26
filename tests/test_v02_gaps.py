@@ -226,14 +226,10 @@ class TestReviewRecoverTextVariants:
 
     @pytest.mark.parametrize("key", ["content", "normalized", "原文"])
     @pytest.mark.asyncio
-    async def test_text_key_variant_enables_full_mode(
-        self, tmp_db: Database, key: str
-    ) -> None:
+    async def test_text_key_variant_enables_full_mode(self, tmp_db: Database, key: str) -> None:
         _add_log(tmp_db, "r1", True, 0.50, detail={key: "待复核原文样例"})
         llm = _DictLLM({"待复核原文样例": _verdict(True)})
-        report = await Reviewer().review_once(
-            tmp_db, llm, _review_cfg(), thresholds=_thresholds()
-        )
+        report = await Reviewer().review_once(tmp_db, llm, _review_cfg(), thresholds=_thresholds())
         assert report.mode == "full"
         assert report.skipped_reason is None
         assert report.reviewed == 1
@@ -250,9 +246,7 @@ class TestReviewMixedTextAvailability:
         _add_log(tmp_db, "b", False, 0.45, detail={"text": "乙"})
         _add_log(tmp_db, "c", True, 0.60)  # 无原文 → 不可复查
         llm = _DictLLM({"甲": _verdict(True), "乙": _verdict(False)})
-        report = await Reviewer().review_once(
-            tmp_db, llm, _review_cfg(), thresholds=_thresholds()
-        )
+        report = await Reviewer().review_once(tmp_db, llm, _review_cfg(), thresholds=_thresholds())
         assert report.mode == "full"
         assert report.sampled == 3
         assert report.reviewed == 2  # 仅可恢复原文的子集参与 LLM 复核

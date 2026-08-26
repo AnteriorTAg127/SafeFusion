@@ -1,4 +1,5 @@
-"""管理 API（:8001，PRD §4.2）：Key / 词库 / 正则规则 / 图片白名单 / 审核日志 / 向量重建。
+"""管理 API（:8001，PRD §4.2）：Key / 词库 / 正则规则 / 图片白名单 / 审核日志 /
+向量重建 / 配置覆盖层读写（v0.2.1 M2）。
 
 设计要点：
 - 认证：全部 ``/admin/*`` 经路由器级依赖要求 ``X-Admin-Token`` 头与启动时解析的
@@ -45,6 +46,16 @@ from starlette.concurrency import run_in_threadpool
 
 from safefusion import __version__
 from safefusion.api.dependencies import Page, pagination, require_admin_token
+from safefusion.config import AppConfig, load_config
+from safefusion.core.config_override import (
+    delete_group_overrides,
+    effective_config,
+    get_config_groups,
+    group_to_dict,
+    mask_secret_fields,
+    save_overrides,
+    validate_group_update,
+)
 from safefusion.core.review import ReviewScheduler
 from safefusion.engines.image_pipeline import WhitelistMatcher, compute_hashes, decode_images
 from safefusion.logging_setup import get_logger
@@ -769,6 +780,76 @@ def create_admin_app(
             logger.exception("向量库重建失败: manifest=%s", manifest)
             raise HTTPException(status_code=500, detail=f"向量库重建失败：{exc}") from exc
         return {"status": "ok", "manifest": manifest, "result": result}
+
+    # ------------------------------------------------------ config 读写（v0.2.1 M2）
+    def _config_base() -> AppConfig:
+        """基配置：注入的 ``AppConfig`` 直接用，否则按「默认值 + 环境变量」加载。
+
+        融合 YAML / 环境变量已在 ``load_config`` 完成；覆盖层在此之上合并。
+        """
+
+        return config if isinstance(config, AppConfig) else load_config(None)
+
+    def _effective_cfg() -> AppConfig:
+        """当前有效配置：基配置 + 覆盖层（环境变量保持最高优先）。"""
+
+        return effective_config(_config_base(), data_dir)
+
+    def _group_response(cfg: AppConfig, group: str) -> dict[str, Any]:
+        """单个分组的响应形态：序列化 + Key 遮蔽（不返回密钥值）。"""
+
+        return mask_secret_fields(group, group_to_dict(cfg, data_dir)[group], cfg)
+
+    @router.get("/config")
+    async def get_config() -> dict[str, Any]:
+        """返回全量有效配置（按分组，决策 F）。
+
+        由「内置默认 < config.yaml < 覆盖层 < 环境变量」合并而成；密钥类字段
+        （``llm.api_key`` / ``embedding.cloud.api_key`` 等）只返回
+        ``{"api_key_env": <变量名或 null>, "configured": <bool>}``，绝不返回值。
+        语义组附带虚拟键 ``fuse_mode``（concat / weighted_avg / pool）。
+        """
+
+        cfg = _effective_cfg()
+        groups = group_to_dict(cfg, data_dir)
+        return {name: mask_secret_fields(name, value, cfg) for name, value in groups.items()}
+
+    @router.put("/config/{group}")
+    async def update_config(group: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """更新单个配置分组：写覆盖层 ``data/config_overrides.json``（重启生效）。
+
+        - 请求体为该分组的 JSON 对象（允许部分键，未给出的键沿用当前有效值）；
+        - 空对象 ``{}`` 表示删除该分组覆盖层（恢复默认，T25「恢复默认」按钮）；
+        - 校验失败返回 422 中文可读错误（未知分组 / 非法 backend / 必填缺失 /
+          数值越界 / ``api_key`` 写入被拒 / fuse_mode 维度一致性提示等）；
+        - 成功返回更新后的分组（同样遮蔽 Key）与 ``restart_required`` 提示。
+        """
+
+        if group not in get_config_groups():
+            raise HTTPException(
+                status_code=422,
+                detail=f"未知配置分组: {group}，可选分组: {', '.join(get_config_groups())}",
+            )
+        if payload == {}:
+            delete_group_overrides(data_dir, group)
+            return {
+                "group": group,
+                "config": _group_response(_effective_cfg(), group),
+                "saved": True,
+                "restart_required": True,
+                "deleted_override": True,
+            }
+        try:
+            validate_group_update(group, payload, _config_base(), data_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        save_overrides(data_dir, group, payload)
+        return {
+            "group": group,
+            "config": _group_response(_effective_cfg(), group),
+            "saved": True,
+            "restart_required": True,
+        }
 
     # ------------------------------------------ 全局异常处理（脱敏 JSON）
     @app.exception_handler(HTTPException)

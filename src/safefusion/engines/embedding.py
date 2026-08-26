@@ -177,9 +177,7 @@ class LocalChineseCLIP(BaseEmbedding):
         # 文本编码器最大序列长度（Chinese-CLIP BERT=512；后续 encode_texts 显式截断）
         text_cfg = getattr(self._model.config, "text_config", None)
         self._text_max: int = (
-            int(getattr(text_cfg, "max_position_embeddings", 512))
-            if text_cfg is not None
-            else 512
+            int(getattr(text_cfg, "max_position_embeddings", 512)) if text_cfg is not None else 512
         )
 
     def encode_texts(self, texts: list[str]) -> np.ndarray:

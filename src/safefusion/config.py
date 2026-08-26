@@ -173,13 +173,17 @@ class KeywordConfig(_BaseConfig):
 
 
 class SemanticConfig(_BaseConfig):
-    """语义层扩展配置（v0.2 新增 Rerank 四信号）。"""
+    """语义层扩展配置（v0.2 新增 Rerank 四信号；v0.2.1 新增 fuse_mode）。"""
 
     rerank_enabled: bool = Field(default=False, description="Rerank 开关（默认关）")
     rerank_w_top: float = Field(default=0.5, description="黑库最高相似度权重")
     rerank_w_margin: float = Field(default=0.3, description="黑白均值差权重")
     rerank_w_rerank: float = Field(default=0.2, description="Rerank 分数权重")
     rerank_top_k: int = Field(default=5, description="Rerank 候选数")
+    fuse_mode: str = Field(
+        default="pool",
+        description="图文融合模式 pool/concat/weighted_avg；跨维度用 concat",
+    )
 
 
 class ReviewConfig(_BaseConfig):

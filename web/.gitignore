@@ -1,0 +1,7 @@
+# 前端构建产物与依赖（由主模型 npm install 生成，不入库）
+node_modules/
+dist/
+.npm-cache/
+
+# vue-tsc 增量构建缓存（理论上写入 node_modules/.tmp，此处兜底）
+*.tsbuildinfo

@@ -5,8 +5,8 @@
 SafeFusion 以「基础规则 → 多模态语义检索 → LLM 兜底」分层漏斗，在低成本下实现文本 + 图片统一审核，追求够用的准确度与较低的误判违规率。核心设计是**一律汇总决策、无短路**，适用于社交平台内容审核（帖子配图、评论、头像等）等低成本低误判的内容风控场景。
 
 - **协议**：GPL-3.0（代码开源；训练与审核数据一律不开源，见[数据资产](#数据资产)）
-- **状态**：v0.1 开发中（核心组件已交付，编排层与 API 待集成）
-- **环境**：Python ≥ 3.10 · uv · FastAPI · SQLite · 自研 numpy 向量库
+- **状态**：v0.2.1（前端管理面板 + 配置全量可自定义）
+- **环境**：Python ≥ 3.10 · uv · FastAPI · SQLite · 自研 numpy 向量库 · Vue3+Vite（前端）
 
 ## 架构
 
@@ -20,7 +20,8 @@ SafeFusion 以「基础规则 → 多模态语义检索 → LLM 兜底」分层�
    ├─ ③ 语义检索层     多模态Embedding(Chinese-CLIP/云端API) → 自研向量库黑白对抗检索 → 三信号置信度
    ├─ ④ LLM 兜底层     OpenAI 兼容多模态 LLM，结构化 JSON 输出，失败回退语义层
    └─ ⑤ 编排与决策     汇总决策(无短路) → 三档置信度动作 → 请求级参数覆盖 → 写缓存/写审计
-管理 API (FastAPI :8001)  Key管理 │ 词库管理 │ 图片白名单管理 │ 审核日志查询
+管理 API (FastAPI :8001)  Key管理 │ 词库管理 │ 图片白名单管理 │ 审核日志查询 │ 正则规则 │ 定时复核 │ 配置管理
+前端管理面板 (Vue3+Vite, 托管于 :8001)  登录 │ 概览 │ 审核记录 │ 词库 │ 白名单 │ 规则 │ 复核 │ 设置（配置自定义）
 ```
 
 关键设计约束：
@@ -94,16 +95,34 @@ uv sync --extra ml
 #    降级项时，按上面步骤检查 ML 依赖与配置。
 ```
 
-### 5. 运行服务（v0.1 待 T10/T11 集成）
+### 5. 运行服务
 
-T10/T11 落地后，双服务分别启动：
+双服务统一入口（v0.1 起）：
 
 ```bash
-.venv\Scripts\python.exe -m uvicorn safefusion.api.app:create_app --host 0.0.0.0 --port 8000
-.venv\Scripts\python.exe -m uvicorn safefusion.api.admin:create_admin_app --host 0.0.0.0 --port 8001
+.venv\Scripts\python.exe -m safefusion.api
+# 审核 API :8000 / 管理 API :8001
 ```
 
-### 6. Docker
+### 6. 前端管理面板（v0.2.1）
+
+浏览器访问 **http://127.0.0.1:8001/**（管理服务托管 `web/dist` 构建产物，同源免 CORS）：
+
+- 页面：登录（X-Admin-Token）→ 概览（统计卡 + 7 天趋势）/ 审核记录 / 词库 / 白名单 / 规则 / 复核 / 设置
+- **设置页 = 配置全量可自定义**：11 个配置分组在线编辑（embedding 后端、阈值、缓存、LLM、语义融合等），保存写入
+  `data/config_overrides.json`（密钥类只显示「环境变量名 + 已配置布尔」，值一律不可编辑），**重启后生效**
+- 配置优先级：内置默认 < `config.yaml` < 管理端覆盖层 < 环境变量
+
+开发模式（本地联调，`/admin` 代理到 `:8001`）：
+
+```bash
+cd web
+npm install            # 首次（npm 缓存建议 --cache ./.npm-cache 沙箱适配）
+npm run dev            # http://localhost:5173
+npm run build          # 产物 web/dist，供后端托管（vue-tsc 类型检查 + vite 打包）
+```
+
+### 7. Docker
 
 ```bash
 docker compose up -d --build
@@ -114,17 +133,20 @@ docker compose up -d --build
 - 数据持久化：`./data` 挂载为容器内 `/app/data`
 - 本地 CLIP / GPU：镜像默认不含 ML 依赖，按 `Dockerfile` 注释自行扩展
 
-## API 概览（v0.1 开发中）
+## API 概览
 
-| 端点 | 说明 | 鉴权 | 状态 |
-|---|---|---|---|
-| `POST /v1/audit` | 审核请求（text / images / context / skip_llm / overrides） | Bearer / X-Api-Key | 🔧 开发中（T10） |
-| `GET /health` | 健康检查 + 指标摘要 | 免认证 | 🔧 开发中（T10） |
-| `POST/GET/PATCH/DELETE /admin/keys` | API Key 生成、禁用、分组（standard/full） | ADMIN_PASSWORD | 🔧 开发中（T11） |
-| `GET/POST/DELETE /admin/keywords` | 词库分类查看、批量导入、词条增删 | ADMIN_PASSWORD | 🔧 开发中（T11） |
-| `GET/POST/DELETE /admin/whitelist/images` | 白名单图片上传/批量导入、pHash 入库 | ADMIN_PASSWORD | 🔧 开发中（T11） |
-| `GET /admin/logs` | 审核记录分页查询与导出 | ADMIN_PASSWORD | 🔧 开发中（T11） |
-| `POST /admin/vectors/rebuild` | 向量库重建 / 增量导入（归一化清单） | ADMIN_PASSWORD | 🔧 开发中（T11） |
+| 端点 | 说明 | 鉴权 |
+|---|---|---|
+| `POST /v1/audit` | 审核请求（text / images / context / skip_llm / overrides） | Bearer / X-Api-Key |
+| `GET /health` | 健康检查 + 指标摘要 | 免认证 |
+| `POST/GET/PATCH/DELETE /admin/keys` | API Key 生成、禁用、分组（standard/full） | ADMIN_PASSWORD |
+| `GET/POST/DELETE /admin/keywords` | 词库分类查看、批量导入、词条增删 | ADMIN_PASSWORD |
+| `GET/POST/DELETE /admin/whitelist/images` | 白名单图片上传/批量导入、pHash 入库 | ADMIN_PASSWORD |
+| `GET /admin/logs` | 审核记录分页查询与导出 | ADMIN_PASSWORD |
+| `GET/POST/DELETE /admin/rules`、`PATCH /admin/rules/{id}/active` | 正则消歧规则 CRUD 与启停（v0.2） | ADMIN_PASSWORD |
+| `GET /admin/review/status`、`POST /admin/review/run` | 定时复核状态与手动触发（v0.2） | ADMIN_PASSWORD |
+| `GET /admin/config`、`PUT /admin/config/{group}` | 配置全量读写（Key 遮蔽；空对象恢复默认；重启生效）（v0.2.1） | ADMIN_PASSWORD |
+| `POST /admin/vectors/rebuild` | 向量库重建 / 增量导入（归一化清单） | ADMIN_PASSWORD |
 
 请求 / 响应契约以 `开发/v0.1/prd.md` §4 与 `src/safefusion/models/schemas.py` 为准。
 
@@ -141,8 +163,9 @@ src/safefusion/
 ├── config.py       # 配置三层加载（默认值 → YAML → 环境变量）
 └── logging_setup.py
 scripts/            # normalize_assets.py 资产归一化；build_vector_db.py 向量库构建（ML，v0.2）
+web/                # 前端管理面板（Vue3+Vite+TS，v0.2.1；node_modules/dist 不入库）
 tests/              # pytest 用例
-data/               # 运行时数据（gitignored，不入库）
+data/               # 运行时数据（gitignored，不入库，含 config_overrides.json 配置覆盖层）
 docs/               # 用户文档（如有）
 ```
 
