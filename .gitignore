@@ -1,0 +1,50 @@
+# ===== 开发过程文档（不入库）=====
+开发/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# 测试 / 质量工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ===== 运行时数据 / 模型 / 密钥 =====
+data/
+models/
+*.log
+logs/
+.env
+.env.*
+!.env.example
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
