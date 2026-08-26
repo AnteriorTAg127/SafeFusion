@@ -228,7 +228,7 @@ def _iter_scalar_targets(
 ) -> Iterator[tuple[str, tuple[Any, str]]]:
     """遍历配置模型的所有标量叶子，产出 (环境变量后缀, (持有字段的模型实例, 字段名))。"""
 
-    for name, field in model.model_fields.items():
+    for name, field in type(model).model_fields.items():
         ann = field.annotation
         if ann is not None and isinstance(ann, type) and issubclass(ann, BaseModel):
             yield from _iter_scalar_targets(getattr(model, name), prefix + (name,))

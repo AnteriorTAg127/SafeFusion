@@ -21,6 +21,8 @@ ENV/
 
 # 测试 / 质量工具缓存
 .pytest_cache/
+.pytest_tmp/
+pytest_ws_tmp/
 .ruff_cache/
 .mypy_cache/
 .tox/

@@ -207,7 +207,10 @@ class WhitelistMatcher:
                 best_row = row
         if best_row is None:
             return None
-        return {**best_row, "distance": best_dist}
+        # distance 必须是原生 int：imagehash 返回 numpy 标量（np.int64），
+        # 会令编排器 _persist 的 json.dumps 抛 TypeError（S2 缺陷修复，
+        # 由 T13 test_debug 专项的 TestSrcDefectS2 用例回归验证）。
+        return {**best_row, "distance": int(best_dist)}
 
     def save(self) -> None:
         """持久化：no-op（DB 即持久化，契约中的 save/load 以 DB 为准）。"""

@@ -53,3 +53,13 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
+
+# pytest 配置（T13 测试专项追加，仅本段，不触碰其它配置段）
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: 需要真实模型 / 网络 / 云端服务的集成测试（默认不运行）",
+]
+# 默认排除 integration 用例：.venv\Scripts\python.exe -m pytest
+addopts = "-m 'not integration'"
+asyncio_mode = "auto"
