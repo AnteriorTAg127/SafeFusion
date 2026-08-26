@@ -41,6 +41,17 @@ from ..models.schemas import AuditDetail, AuditRequest, AuditResult
 from .aggregator import decide_tier, merge_final, summarize_basic
 from .context import AppContext
 
+
+def _high_freq_key(text_hash: str, tier: str) -> str:
+    """高频缓存键：文本哈希掺入 Key 分组，standard / full 结果互不污染。
+
+    T8 契约的 ``get/put_high_freq(text_hash)`` 键仅含文本哈希，而 standard
+    写入的结果无 detail，full 档直接命中会造成明细降级（主模型集成修复，
+    2026-08-26，T10 自检暴露）。
+    """
+
+    return hashlib.sha256(f"{text_hash}:{tier}".encode()).hexdigest()
+
 _logger = get_logger("core.orchestrator")
 
 
@@ -123,7 +134,12 @@ class AuditOrchestrator:
         cache_key: str | None = None
         if cache_layer is not None:
             cache_key = cache_layer.audit_key(
-                text_hash, frame_md5s, {"skip_llm": req.skip_llm, "overrides": overrides_dump}
+                text_hash,
+                frame_md5s,
+                # 键含 tier：standard 与 full 的缓存隔离，避免 full 命中
+                # standard 写入的无 detail 结果（主模型集成修复，2026-08-26，
+                # 修复 T10 报告缺陷②）。
+                {"skip_llm": req.skip_llm, "overrides": overrides_dump, "tier": key_tier},
             )
             cached = cache_layer.get_audit_result(cache_key)
             if cached is not None:
@@ -139,7 +155,7 @@ class AuditOrchestrator:
 
         # ---------- ⑤ 高频缓存（仅无 context 的文本请求） ----------
         if cache_layer is not None and normalized and req.context is None:
-            high_hit = cache_layer.get_high_freq(text_hash)
+            high_hit = cache_layer.get_high_freq(_high_freq_key(text_hash, key_tier))
             if high_hit is not None:
                 return self._serve_cached(high_hit, key_tier)
 
@@ -446,7 +462,9 @@ class AuditOrchestrator:
         if cache_layer is not None and cache_key is not None:
             cache_layer.put_audit_result(cache_key, result.model_dump())
         if cache_layer is not None and normalized and req.context is None:
-            cache_layer.put_high_freq(text_hash, result.model_dump())
+            cache_layer.put_high_freq(
+                _high_freq_key(text_hash, key_tier), result.model_dump()
+            )
         if cache_layer is not None and not normalized and len(frame_phash_hexes) == 1:
             cache_layer.put_dedup(frame_md5s[0], frame_phash_hexes[0], result.model_dump())
         if db is not None:

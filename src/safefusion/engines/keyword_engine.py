@@ -231,8 +231,14 @@ class KeywordEngine:
                     variant_map.setdefault(variant, []).append((word, category, kind))
         for variant, entries in variant_map.items():
             automaton.add_word(variant, (variant, entries))
-        automaton.make_automaton()
-        self._automaton = automaton
+        if variant_map:
+            automaton.make_automaton()
+            self._automaton = automaton
+        else:
+            # 空词库：pyahocorasick 对空自动机调用 make_automaton 会抛
+            # AttributeError，此时保持 _automaton=None，scan 依空值守卫直接返回
+            # 空命中（主模型集成修复，2026-08-26，修复 T10 报告缺陷①）。
+            self._automaton = None
         self._loaded = True
         _logger.info("关键词引擎加载完成：%d 类别 / %d 个变体", len(categories), len(variant_map))
 
