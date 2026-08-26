@@ -277,9 +277,12 @@ class LightTextModel:
             logits = self._forward(self._feature_ids(text))
             probs = self._torch.softmax(logits, dim=1)[0]
             label_idx = int(logits.argmax(dim=1)[0])
+            score_t = probs[self._violation_idx]
+            # detach 消除推理告警；FakeTorch（单测）无 detach 时原样透传
+            score = score_t.detach() if hasattr(score_t, "detach") else score_t
             return {
                 "label": self._classes[label_idx],
-                "score": float(probs[self._violation_idx]),
+                "score": float(score),
                 "violation": label_idx == self._violation_idx,
             }
         except Exception as exc:  # 单条失败不拖垮整批，降级返回 None

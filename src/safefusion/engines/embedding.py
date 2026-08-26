@@ -135,6 +135,9 @@ class LocalChineseCLIP(BaseEmbedding):
         try:
             import torch  # type: ignore[import-not-found]
             from transformers import (  # type: ignore[import-not-found]
+                AutoConfig,
+                ChineseCLIPModel,
+                ChineseCLIPProcessor,
                 CLIPModel,
                 CLIPProcessor,
             )
@@ -153,17 +156,45 @@ class LocalChineseCLIP(BaseEmbedding):
 
         model_id = self.weights_path or self.model_name
         _logger.info("加载 Chinese-CLIP 模型 %s（device=%s）", model_id, device)
-        self._model = CLIPModel.from_pretrained(model_id)
-        self._processor = CLIPProcessor.from_pretrained(self.weights_path or self.model_name)
+        # Chinese-CLIP 的文本编码器是 BERT 结构，CLIPModel 无法装载其权重
+        # （大量 MISSING/UNEXPECTED 键 → 文本特征为随机初始化垃圾）。按
+        # config.model_type 选择专用类 ChineseCLIPModel/ChineseCLIPProcessor，
+        # 其余模型回退 CLIP*（主模型修复，2026-08-26，M2 实测捕获）。
+        try:
+            model_cfg = AutoConfig.from_pretrained(model_id)
+            is_chinese_clip = getattr(model_cfg, "model_type", "") == "chinese_clip"
+        except Exception:
+            is_chinese_clip = "chinese" in model_id.lower() and "clip" in model_id.lower()
+        if is_chinese_clip:
+            self._model = ChineseCLIPModel.from_pretrained(model_id)
+            self._processor = ChineseCLIPProcessor.from_pretrained(model_id)
+        else:
+            self._model = CLIPModel.from_pretrained(model_id)
+            self._processor = CLIPProcessor.from_pretrained(model_id)
         self._model.to(device)
         self._model.eval()
         self._output_dim: int = int(self._model.config.projection_dim)
+        # 文本编码器最大序列长度（Chinese-CLIP BERT=512；后续 encode_texts 显式截断）
+        text_cfg = getattr(self._model.config, "text_config", None)
+        self._text_max: int = (
+            int(getattr(text_cfg, "max_position_embeddings", 512))
+            if text_cfg is not None
+            else 512
+        )
 
     def encode_texts(self, texts: list[str]) -> np.ndarray:
         """编码文本列表，返回形状 ``(n, d)`` 的 L2 归一化向量矩阵。"""
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
-        inputs = self._processor(text=texts, padding=True, truncation=True, return_tensors="pt")
+        # 显式 max_length：长文本（违规语料含数百字）必须截断到文本编码器
+        # 上限，否则 batch 与单条编码都会抛序列长度错误而被跳过。
+        inputs = self._processor(
+            text=texts,
+            padding=True,
+            truncation=True,
+            max_length=self._text_max,
+            return_tensors="pt",
+        )
         inputs = {key: value.to(self._device) for key, value in inputs.items()}
         with self._torch.no_grad():
             features = self._model.get_text_features(**inputs)
