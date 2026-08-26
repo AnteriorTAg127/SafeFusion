@@ -110,8 +110,16 @@ class CacheItemConfig(_BaseConfig):
 
 
 class CacheConfig(_BaseConfig):
-    """五级缓存总配置。"""
+    """五级缓存总配置（v0.2 新增 backend/redis 双后端）。"""
 
+    backend: str = Field(
+        default="memory",
+        description="缓存后端：memory（进程内，默认）| redis",
+    )
+    redis: "RedisCacheConfig" = Field(
+        default_factory=lambda: RedisCacheConfig(),
+        description="Redis 后端连接配置",
+    )
     audit_cache: CacheItemConfig = Field(
         default_factory=lambda: CacheItemConfig(enabled=True, capacity=2000, ttl=3600),
         description="① 审核缓存：完整键（文本哈希+帧哈希+关键参数）",
@@ -133,6 +141,57 @@ class CacheConfig(_BaseConfig):
     )
 
 
+class RedisCacheConfig(_BaseConfig):
+    """Redis 缓存后端连接配置（v0.2 新增）。"""
+
+    url: str = Field(default="redis://127.0.0.1:6379/0", description="Redis 连接 URL")
+    prefix: str = Field(default="sf:", description="缓存键统一前缀")
+
+
+class ImageConfig(_BaseConfig):
+    """图片处理配置（v0.2 新增动图抽帧）。"""
+
+    animated: "AnimatedImageConfig" = Field(
+        default_factory=lambda: AnimatedImageConfig(), description="动图抽帧配置"
+    )
+
+
+class AnimatedImageConfig(_BaseConfig):
+    """动图（GIF）抽帧配置（v0.2 新增，PRD v0.2 M3）。"""
+
+    enabled: bool = Field(default=True, description="false 时退回 v0.1 首帧降级行为")
+    frames: int = Field(default=5, description="均匀抽帧数（3~5，可配）")
+    mode: str = Field(default="uniform", description="抽帧模式：uniform 均匀 | first 首帧")
+
+
+class KeywordConfig(_BaseConfig):
+    """关键词层配置（v0.2 新增正则规则开关）。"""
+
+    regex_rules_enabled: bool = Field(
+        default=True, description="正则消歧规则库开关；false 时规则层跳过"
+    )
+
+
+class SemanticConfig(_BaseConfig):
+    """语义层扩展配置（v0.2 新增 Rerank 四信号）。"""
+
+    rerank_enabled: bool = Field(default=False, description="Rerank 开关（默认关）")
+    rerank_w_top: float = Field(default=0.5, description="黑库最高相似度权重")
+    rerank_w_margin: float = Field(default=0.3, description="黑白均值差权重")
+    rerank_w_rerank: float = Field(default=0.2, description="Rerank 分数权重")
+    rerank_top_k: int = Field(default=5, description="Rerank 候选数")
+
+
+class ReviewConfig(_BaseConfig):
+    """定时复核配置（v0.2 新增 M7）。"""
+
+    interval_min: int = Field(default=240, description="复核周期（分钟）；0 禁用自动调度")
+    band_low: float = Field(default=0.35, description="采样下界（置信度中带）")
+    band_high: float = Field(default=0.75, description="采样上界（置信度中带）")
+    sample_size: int = Field(default=50, description="每轮采样上限")
+    auto_tune: bool = Field(default=False, description="是否自动采纳阈值建议（默认仅出报告）")
+
+
 class LightModelConfig(_BaseConfig):
     """轻量文本风险模型配置（复用已训 fasttext.pt）。"""
 
@@ -152,7 +211,7 @@ class LoggingConfig(_BaseConfig):
 
 
 class AppConfig(_BaseConfig):
-    """应用总配置：server / data_dir / thresholds / embedding / llm / cache / light_model / logging。"""  # noqa: E501
+    """应用总配置：server / data_dir / thresholds / embedding / llm / cache / light_model / logging / image / keyword / semantic / review。"""  # noqa: E501
 
     server: ServerConfig = Field(default_factory=ServerConfig, description="服务监听配置")
     data_dir: str = Field(default="./data", description="运行时数据目录（相对路径基于启动目录）")
@@ -166,6 +225,14 @@ class AppConfig(_BaseConfig):
         default_factory=LightModelConfig, description="轻量文本风险模型"
     )
     logging: LoggingConfig = Field(default_factory=LoggingConfig, description="日志配置")
+    image: ImageConfig = Field(default_factory=ImageConfig, description="图片处理（动图抽帧）")
+    keyword: KeywordConfig = Field(
+        default_factory=KeywordConfig, description="关键词层（正则规则开关）"
+    )
+    semantic: SemanticConfig = Field(
+        default_factory=SemanticConfig, description="语义层（Rerank 四信号）"
+    )
+    review: ReviewConfig = Field(default_factory=ReviewConfig, description="定时复核")
 
 
 def load_config(path: str | None = None) -> AppConfig:
