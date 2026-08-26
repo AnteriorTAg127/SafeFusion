@@ -17,6 +17,7 @@ wheels/
 .venv/
 venv/
 ENV/
+.uv-cache/
 
 # 测试 / 质量工具缓存
 .pytest_cache/

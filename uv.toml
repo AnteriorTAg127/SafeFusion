@@ -1,0 +1,4 @@
+# uv 项目级配置：沙箱环境下收敛到工作区内
+cache-dir = ".uv-cache"
+# 只用系统 Python，避免 uv 访问其托管 Python 目录（工作区外）
+python-preference = "only-system"

@@ -52,6 +52,18 @@ data/            运行时数据 / 词库 / 本地模型缓存（不入库）
 - **每个子代理开工前必须先读取 `开发/rules.md`**；完工后必须更新 `开发/changelog.md`。
 - 按文件边界拆分任务，避免多个子代理修改同一文件；先基础设施（包骨架、配置加载）后功能模块，集成层最后做。
 
+## 工程命令（uv 环境，含沙箱约定）
+
+- 依赖管理统一使用 **uv**：`uv sync`（生成/复用 `.venv` 与 `uv.lock`）、加 ML 依赖用 `uv sync --extra ml`（torch/transformers，本地 CLIP 与 fasttext 推理需要）。
+- **沙箱约定（重要）**：uv 查询解释器走管道 stdio，会被文件沙箱拒绝——只有主代理可提权执行 `uv sync`；**一切运行/测试/检查一律直接调用解释器，禁止 `uv run`**：
+  ```text
+  .venv\Scripts\python.exe -m pytest          # 测试
+  .venv\Scripts\python.exe -m ruff check src  # 静态检查
+  .venv\Scripts\python.exe -m uvicorn ...     # 启动服务
+  ```
+- uv 缓存已通过项目级 `uv.toml` 收敛到 `.uv-cache/`（已 gitignore）；`uv.lock` 必须提交。
+- 子代理禁止自行安装依赖；缺依赖时在报告中说明，由主代理统一处理。
+
 ## 硬性规则
 
 1. 密钥 / API Key 只能来自环境变量或 gitignored 配置文件；严禁写入任何会提交的文件、文档或日志。

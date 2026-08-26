@@ -1,0 +1,14 @@
+# SafeFusion 核心依赖（与 pyproject.toml 的 dependencies 一致，pip 直装用）
+# 本地模型推理所需 torch / transformers 按需安装：pip install -e ".[ml]"
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.0
+PyYAML>=6.0
+numpy>=1.24
+pyahocorasick>=2.1
+pypinyin>=0.51
+openai>=1.0
+httpx>=0.27
+pillow>=10.0
+imagehash>=4.3
+python-multipart>=0.0.9
