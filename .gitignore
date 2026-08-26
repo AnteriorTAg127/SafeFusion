@@ -23,6 +23,7 @@ ENV/
 .pytest_cache/
 .pytest_tmp/
 pytest_ws_tmp/
+pytest-cache-files-*/
 .ruff_cache/
 .mypy_cache/
 .tox/
