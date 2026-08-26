@@ -1,11 +1,12 @@
-"""多模态语义检索引擎：黑白对抗检索 + 三信号置信度（PRD §3.1 / §3.3，T6 任务卡）。
+"""多模态语义检索引擎：黑白对抗检索 + 三/四信号置信度（PRD §3.1 / §3.3，T6 任务卡 + v0.2 M6）。
 
 对单个审核输入（可选文本 + 零或多个帧）执行：
 1. **向量化** —— 文本经 ``encode_texts`` 编码为单向量；多帧经 ``encode_images``
    编码后取平均（图片池化）得到单向量；图文并存时经 ``fuse_vectors(text_vec,
    [image_pool], mode)`` 融合为单一查询向量（默认 ``pool`` 平均融合）；
 2. **对抗检索** —— 查询向量分别对黑库 / 白库各取 Top-K；
-3. **三信号置信度** —— 依 PRD §3.1「置信度三信号（v0.1，无 Rerank）」计算。
+3. **置信度** —— 默认三信号（PRD §3.1，v0.1 无 Rerank）；``rerank_enabled``
+   开启时（PRD v0.2 M6，决策 A）对黑库候选做 Rerank 二次打分，扩展为四信号。
 
 本模块只依赖 T2/T5 的**契约**（见 开发/v0.1/分工.md「统一接口契约」），
 不对未完成模块做硬 import：embedding 与 store 以鸭子类型使用
@@ -29,6 +30,8 @@ try:  # T5 可能未合并：fuse_vectors 缺失时回退到本模块等价实�
     from safefusion.engines.embedding import fuse_vectors as _embedding_fuse_vectors
 except ImportError:
     _embedding_fuse_vectors = None
+
+from safefusion.engines.rerank import get_rerank_backend
 
 _logger = logging.getLogger("safefusion.engines.semantic")
 
@@ -75,15 +78,24 @@ class SemanticEngine:
 
     - 信号 1：``black_top_score``（s_bt）—— 黑库最高余弦相似度；
     - 信号 2：``black_avg``（s_ba）/ ``white_avg``（s_wa）—— 黑白库各自 Top-K 平均相似度；
-    - 信号 3：``margin = s_ba − s_wa``，与 ``margin_w``（默认 0.05）比较。
+    - 信号 3：``margin = s_ba − s_wa``，与 ``margin_w``（默认 0.05）比较；
+    - 信号 4（PRD v0.2 M6，``rerank_enabled=True`` 时）：``rerank_black_max``
+      —— 黑库候选经 Rerank 二次打分（查询-候选成对余弦）后的最高分。
 
     ``margin_signal = max(0, s_ba − s_wa − margin_w)``
 
-    ``confidence_raw = w_top·s_bt + w_margin·(margin_signal / margin_norm)``
+    v0.1（Rerank 关闭）：
+    ``confidence = clip(w_top·s_bt + w_margin·(margin_signal / margin_norm), 0, 1)``
 
-    ``confidence = clip(confidence_raw, 0, 1)``
+    v0.2（Rerank 开启）：
+    ``confidence = clip(w_top·s_bt + w_margin·(margin_signal / margin_norm)
+    + w_rerank·rerank_black_max, 0, 1)``
 
-    默认权重：``w_top = 0.6``、``w_margin = 0.4``、``margin_norm = 0.3``、
+    四信号权重取自 ``rerank_w_top / rerank_w_margin / rerank_w_rerank``
+    （默认 0.5 / 0.3 / 0.2）；Rerank 失败时 ``rerank_black_max`` 记为 None
+    并按 0 计入（回退三信号效果，不拖垮整次审核）。
+
+    v0.1 默认权重：``w_top = 0.6``、``w_margin = 0.4``、``margin_norm = 0.3``、
     ``semantic_threshold = 0.67``。
 
     判定（PRD §3.1）：``triggered = (s_bt ≥ semantic_threshold) or (margin_signal > 0)``；
@@ -101,6 +113,12 @@ class SemanticEngine:
         "margin_norm": 0.3,
         "weights": {"w_top": 0.6, "w_margin": 0.4},
         "fuse_mode": "pool",
+        # v0.2 M6 Rerank 四信号：默认关闭（行为与 v0.1 完全一致）
+        "rerank_enabled": False,
+        "rerank_w_top": 0.5,
+        "rerank_w_margin": 0.3,
+        "rerank_w_rerank": 0.2,
+        "rerank_top_k": 5,
     }
 
     def __init__(
@@ -116,7 +134,9 @@ class SemanticEngine:
             store: T2 契约的向量库（鸭子类型）。
             thresholds: 阈值字典（可与默认值部分合并），支持键：
                 semantic_threshold / margin_w / top_k / margin_norm /
-                weights{ w_top, w_margin } / fuse_mode。
+                weights{ w_top, w_margin } / fuse_mode，以及 v0.2 Rerank 键
+                （键名对齐 config.semantic）：rerank_enabled /
+                rerank_w_top / rerank_w_margin / rerank_w_rerank / rerank_top_k。
         """
         self.embedding = embedding
         self.store = store
@@ -152,6 +172,9 @@ class SemanticEngine:
             - ``black_top``: dict | None，黑库最高分命中
               ``{"id", "score", "category", "metadata"}``；
             - ``black_avg`` / ``white_avg``: float，黑白库 Top-K 平均相似度；
+            - ``rerank_black_max``: float | None，仅 ``rerank_enabled=True``
+              时出现：黑库候选 Rerank 二次打分最高分；失败为 None（置信度
+              中该信号按 0 计入，回退三信号效果）；关闭时无此键（与 v0.1 一致）；
             - ``reason``: str | None，正常为 None；降级时为降级原因码
               （empty_input / embedding_error / store_error /
               empty_black_pool / empty_white_pool）。
@@ -191,20 +214,33 @@ class SemanticEngine:
 
         margin_signal = max(0.0, black_avg - white_avg - margin_w)
         if margin_norm <= 0:
-            _logger.warning(
-                "margin_norm=%s 非法（须>0），回退默认 0.3", margin_norm
-            )
+            _logger.warning("margin_norm=%s 非法（须>0），回退默认 0.3", margin_norm)
             margin_norm = 0.3
-        confidence_raw = w_top * black_top_score + w_margin * (
-            margin_signal / margin_norm
-        )
+
+        # v0.2 M6 四信号：rerank_enabled 时对黑库候选做查询-候选成对重排，
+        # rerank_black_max 参与置信度；失败返回 None（该信号按 0 计入）
+        rerank_enabled = bool(eff.get("rerank_enabled", False))
+        rerank_black_max: float | None = None
+        if rerank_enabled:
+            rerank_black_max = self._run_rerank(query, black_hits, eff)
+
+        if rerank_enabled:
+            w_top = float(eff.get("rerank_w_top", 0.5))
+            w_margin = float(eff.get("rerank_w_margin", 0.3))
+            w_rerank = float(eff.get("rerank_w_rerank", 0.2))
+            rerank_term = w_rerank * (rerank_black_max if rerank_black_max is not None else 0.0)
+            confidence_raw = (
+                w_top * black_top_score + w_margin * (margin_signal / margin_norm) + rerank_term
+            )
+        else:
+            confidence_raw = w_top * black_top_score + w_margin * (margin_signal / margin_norm)
         confidence = float(np.clip(confidence_raw, 0.0, 1.0))
 
         triggered = black_top_score >= semantic_threshold or margin_signal > 0
         metadata = self._hit_metadata(top_hit)
         category = metadata.get("category") if isinstance(metadata, dict) else None
 
-        return {
+        result = {
             "triggered": triggered,
             "confidence": confidence,
             "category": category,
@@ -218,10 +254,12 @@ class SemanticEngine:
             "white_avg": white_avg,
             "reason": None,
         }
+        # v0.2 M6：仅开启 Rerank 时暴露 rerank_black_max（关闭时与 v0.1 输出一致）
+        if rerank_enabled:
+            result["rerank_black_max"] = rerank_black_max
+        return result
 
-    def _build_query(
-        self, text: str | None, frames: list[Image]
-    ) -> np.ndarray | None:
+    def _build_query(self, text: str | None, frames: list[Image]) -> np.ndarray | None:
         """将文本与帧编码为单一查询向量；任一模态编码失败返回 None（上层降级）。
 
         多帧输出按平均池化为单向量；兼容后端返回 ``(n, d)`` 与单条 ``(d,)`` 两种形状。
@@ -252,9 +290,7 @@ class SemanticEngine:
             return image_vec
         return None
 
-    def _fuse_vectors(
-        self, text_vec: np.ndarray, image_vecs: list[np.ndarray]
-    ) -> np.ndarray:
+    def _fuse_vectors(self, text_vec: np.ndarray, image_vecs: list[np.ndarray]) -> np.ndarray:
         """图文向量融合；优先调用 T5 的 ``fuse_vectors``，缺失时本地等价实现。
 
         多帧在进入本方法前已池化为单向量，故 ``image_vecs`` 至多一个元素；
@@ -275,6 +311,48 @@ class SemanticEngine:
             return 0.5 * text_vec + 0.5 * image_pool
         # pool / 其他未知模式：取平均（维度不变，最安全）
         return (text_vec + image_pool) / 2.0
+
+    def _run_rerank(
+        self, query: np.ndarray, black_hits: list[Any], eff: dict[str, Any]
+    ) -> float | None:
+        """对黑库候选执行 Rerank 二次打分（PRD v0.2 M6，决策 A）。
+
+        将命中转成候选字典（``{"id", "score", "metadata"}``）交给
+        RerankBackend 重排，返回黑库候选最大 ``rerank_score``。
+        全程异常隔离：后端 / 编码任何失败仅记录日志并返回 None，
+        调用方回退三信号置信度，不拖垮整次审核（降级而不误判）。
+
+        Args:
+            query: 查询融合向量。
+            black_hits: 黑库 Top-K 命中（契约 SearchHit 或等价鸭子类型）。
+            eff: 生效阈值（含 rerank_top_k 候选数与 rerank 开关）。
+
+        Returns:
+            黑库候选最大 rerank_score；后端执行失败或结果为空时 None。
+        """
+        try:
+            rerank_top_k = max(0, int(eff.get("rerank_top_k", 5)))
+        except (TypeError, ValueError):
+            rerank_top_k = 5
+        candidates = [
+            {
+                "id": self._hit_id(hit),
+                "score": self._hit_score(hit),
+                "metadata": self._hit_metadata(hit),
+            }
+            for hit in black_hits
+        ]
+        if rerank_top_k >= 1:
+            candidates = candidates[:rerank_top_k]
+        try:
+            backend = get_rerank_backend(eff, self.embedding)
+            reranked = backend.rerank(query, candidates)
+        except Exception:
+            _logger.exception("Rerank 执行失败（回退三信号置信度）")
+            return None
+        if not reranked:
+            return None
+        return max(float(item.get("rerank_score", item.get("score", 0.0))) for item in reranked)
 
     def _effective_thresholds(self, ov: dict[str, Any] | None) -> dict[str, Any]:
         """合并默认阈值与请求级覆盖（仅接受有限数值，非法覆盖忽略并告警）。"""

@@ -71,6 +71,18 @@ def _l2_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / safe
 
 
+def _features_to_numpy(features: Any) -> np.ndarray:
+    """把 CLIP 特征输出归一化为 L2 向量矩阵。
+
+    transformers 4.x 的 ``get_text_features/get_image_features`` 直接返回张量
+    ``(n, d)``；5.x 返回 ``BaseModelOutputWithPooling`` 数据类（``.pooler_output``
+    即投影后张量）。shim 兼容两者（T15 报告阻塞项，主模型 2026-08-26）。
+    """
+
+    raw = getattr(features, "pooler_output", features)
+    return _l2_rows(np.asarray(raw.cpu().numpy()))
+
+
 class BaseEmbedding(ABC):
     """Embedding 后端抽象基类。
 
@@ -151,13 +163,11 @@ class LocalChineseCLIP(BaseEmbedding):
         """编码文本列表，返回形状 ``(n, d)`` 的 L2 归一化向量矩阵。"""
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
-        inputs = self._processor(
-            text=texts, padding=True, truncation=True, return_tensors="pt"
-        )
+        inputs = self._processor(text=texts, padding=True, truncation=True, return_tensors="pt")
         inputs = {key: value.to(self._device) for key, value in inputs.items()}
         with self._torch.no_grad():
             features = self._model.get_text_features(**inputs)
-        return _l2_rows(features.cpu().numpy())
+        return _features_to_numpy(features)
 
     def encode_images(self, images: list[Image.Image]) -> np.ndarray:
         """编码图片列表，返回形状 ``(n, d)`` 的 L2 归一化向量矩阵。"""
@@ -167,7 +177,7 @@ class LocalChineseCLIP(BaseEmbedding):
         inputs = {key: value.to(self._device) for key, value in inputs.items()}
         with self._torch.no_grad():
             features = self._model.get_image_features(**inputs)
-        return _l2_rows(features.cpu().numpy())
+        return _features_to_numpy(features)
 
 
 class CloudEmbeddingAPI(BaseEmbedding):

@@ -35,7 +35,7 @@ import imagehash
 from PIL import Image
 
 from ..engines.image_pipeline import compute_hashes, decode_images
-from ..engines.keyword_engine import KeywordHitData, RegexRuleEngine
+from ..engines.keyword_engine import KeywordHitData
 from ..logging_setup import get_logger
 from ..models.schemas import AuditDetail, AuditRequest, AuditResult
 from .aggregator import decide_tier, merge_final, summarize_basic
@@ -52,6 +52,7 @@ def _high_freq_key(text_hash: str, tier: str) -> str:
 
     return hashlib.sha256(f"{text_hash}:{tier}".encode()).hexdigest()
 
+
 _logger = get_logger("core.orchestrator")
 
 
@@ -67,8 +68,9 @@ class AuditOrchestrator:
 
         self.context = container
         self._cfg = container.config
-        # 正则消歧引擎：无内置规则时 disambiguate 原样保留命中（不豁免）
-        self._regex = RegexRuleEngine()
+        # 正则消歧规则：统一走 ctx.keyword_engine（T17 热重载后管理端写入即生效；
+        # rules_enabled=False 时 disambiguate 原样透传，与 v0.1 行为一致）。
+        # 不再持有独立空规则引擎（T17 集成钩子①，主模型 2026-08-26）。
 
     # ------------------------------------------------------------------ 主入口
 
@@ -113,12 +115,17 @@ class AuditOrchestrator:
         frame_phash_hexes: list[str] = []
         frame_phashes: list[imagehash.ImageHash] = []
         if req.images:
-            frames = await decode_images(req.images)
+            # v0.2 M3：动图按 config.image.animated 均匀抽帧，输出全部帧
+            # （每帧独立元素，whitelist 逐帧、语义层池化平均天然按帧生效）
+            frames = await decode_images(req.images, animated=self._cfg.image.animated)
             for img in frames:
                 md5_hex, phash = compute_hashes(img)
                 frame_md5s.append(md5_hex)
                 frame_phash_hexes.append(str(phash))
                 frame_phashes.append(phash)
+        # 动图判定：任一输入展开出多帧 ⇒ 该请求含动图（静态多图请求帧数==输入数；
+        # 用于 LLM 兜底档的多帧连贯性提示，PRD §3.5 / v0.2 M3）
+        animated_request = len(frames) > len(req.images or [])
 
         # 请求级参数覆盖（① 已保证 overrides 仅 full 组到达此处）
         overrides_dump = (
@@ -168,7 +175,7 @@ class AuditOrchestrator:
 
         if ctx.keyword_engine is not None and normalized:
             raw_hits = ctx.keyword_engine.scan(normalized)
-            kept_hits, exempted = self._regex.disambiguate(normalized, raw_hits)
+            kept_hits, exempted = ctx.keyword_engine.disambiguate(normalized, raw_hits)
             keyword_detail = {
                 "hits": [dict(hit._asdict()) for hit in kept_hits],
                 "regex_filtered": [_exempted_to_dict(item) for item in exempted],
@@ -261,7 +268,12 @@ class AuditOrchestrator:
             else:
                 # ⑨ LLM 兜底档：skip_llm / 不可用 / 失败 → 回退语义层结果
                 verdict = await self._llm_judge(
-                    req, normalized or None, frames, text_hash, cache_layer
+                    req,
+                    normalized or None,
+                    frames,
+                    text_hash,
+                    cache_layer,
+                    animated=animated_request,
                 )
                 if verdict is not None:
                     if detail_payload is not None:
@@ -303,8 +315,20 @@ class AuditOrchestrator:
         frames: list[Image.Image],
         text_hash: str,
         cache_layer: Any,
+        *,
+        animated: bool = False,
     ) -> dict[str, Any] | None:
-        """LLM 兜底裁决：短文本 LLM 缓存优先；跳过 / 不可用 / 失败返回 None。"""
+        """LLM 兜底裁决：短文本 LLM 缓存优先；跳过 / 不可用 / 失败返回 None。
+
+        Args:
+            req: 审核请求（skip_llm / context 参与判定）。
+            text: 净化后的待审核文本，可为 None。
+            frames: 已解码帧列表（动图时为全部抽帧）。
+            text_hash: 文本哈希（短文本 LLM 缓存键）。
+            cache_layer: 缓存层（短文本 LLM 缓存读写；可为 None）。
+            animated: 是否为动图多帧请求；True 时 ``LLMClient.judge`` 附加
+                多帧连贯性提示词（v0.2 M3 / PRD §3.5）。
+        """
 
         llm = self.context.llm
         if req.skip_llm or llm is None or not llm.available:
@@ -314,7 +338,7 @@ class AuditOrchestrator:
         if short and cache_layer is not None:
             verdict = cache_layer.get_short_text_llm(text_hash)
         if verdict is None:
-            verdict = await llm.judge(text, frames, req.context)
+            verdict = await llm.judge(text, frames, req.context, animated=animated)
             if verdict is not None and short and cache_layer is not None:
                 cache_layer.put_short_text_llm(text_hash, verdict)
         return verdict
@@ -462,9 +486,7 @@ class AuditOrchestrator:
         if cache_layer is not None and cache_key is not None:
             cache_layer.put_audit_result(cache_key, result.model_dump())
         if cache_layer is not None and normalized and req.context is None:
-            cache_layer.put_high_freq(
-                _high_freq_key(text_hash, key_tier), result.model_dump()
-            )
+            cache_layer.put_high_freq(_high_freq_key(text_hash, key_tier), result.model_dump())
         if cache_layer is not None and not normalized and len(frame_phash_hexes) == 1:
             cache_layer.put_dedup(frame_md5s[0], frame_phash_hexes[0], result.model_dump())
         if db is not None:

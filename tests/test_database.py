@@ -91,6 +91,73 @@ class TestKeywords:
         assert tmp_db.list_keywords() == []
 
 
+class TestRules:
+    """rules 表（PRD v0.2 M4）：批量导入（action/正则校验、重复跳过）/ 过滤 / 启停 / 删除。"""
+
+    def test_add_and_list(self, tmp_db: Database) -> None:
+        inserted, skipped = tmp_db.add_rules(
+            [(None, "今天天气真不错", "exempt", "天气豁免"), ("色情", "裸聊", "violate", None)]
+        )
+        assert (inserted, skipped) == (2, 0)
+        rows = tmp_db.list_rules()
+        assert len(rows) == 2
+        # 无类别规则类别存为空串（引擎侧视为不限定类别）
+        row = next(r for r in rows if r["pattern"] == "今天天气真不错")
+        assert row["category"] == ""
+        assert row["action"] == "exempt"
+        assert row["note"] == "天气豁免"
+        assert row["is_active"] == 1
+        assert row["created_at"]
+
+    def test_list_filter_by_category(self, tmp_db: Database) -> None:
+        tmp_db.add_rules([("色情", "裸聊", "violate", None), (None, "天气", "exempt", None)])
+        assert [r["pattern"] for r in tmp_db.list_rules(category="色情")] == ["裸聊"]
+
+    def test_active_only_and_all(self, tmp_db: Database) -> None:
+        tmp_db.add_rules([("色情", "裸聊", "violate", None)])
+        rule_id = tmp_db.list_rules()[0]["id"]
+        assert tmp_db.set_rule_active(rule_id, False) is True
+        assert tmp_db.list_rules(active_only=True) == []
+        all_rows = tmp_db.list_rules(active_only=False)
+        assert len(all_rows) == 1
+        assert all_rows[0]["is_active"] == 0
+        assert tmp_db.set_rule_active(999, True) is False  # 不存在
+
+    def test_duplicate_skipped_not_overwrite(self, tmp_db: Database) -> None:
+        tmp_db.add_rules([("色情", "裸聊", "violate", "old")])
+        inserted, skipped = tmp_db.add_rules(
+            [("色情", "裸聊", "violate", "new"), ("色情", "新词", "exempt", None)]
+        )
+        assert inserted == 1
+        assert skipped == 1
+        rows = tmp_db.list_rules()
+        assert len(rows) == 2
+        # 旧规则 note 未被覆盖
+        assert {r["note"] for r in rows} == {"old", None}
+
+    def test_invalid_action_raises(self, tmp_db: Database) -> None:
+        with pytest.raises(ValueError, match="action"):
+            tmp_db.add_rules([("色情", "裸聊", "ban", None)])
+
+    def test_invalid_regex_raises(self, tmp_db: Database) -> None:
+        with pytest.raises(ValueError, match="正则"):
+            tmp_db.add_rules([("色情", "([", "exempt", None)])
+
+    def test_empty_pattern_raises(self, tmp_db: Database) -> None:
+        with pytest.raises(ValueError, match="pattern"):
+            tmp_db.add_rules([("色情", "", "exempt", None)])
+
+    def test_empty_add(self, tmp_db: Database) -> None:
+        assert tmp_db.add_rules([]) == (0, 0)
+
+    def test_delete_rule(self, tmp_db: Database) -> None:
+        tmp_db.add_rules([("色情", "裸聊", "violate", None)])
+        rule_id = tmp_db.list_rules()[0]["id"]
+        assert tmp_db.delete_rule(rule_id) is True
+        assert tmp_db.list_rules() == []
+        assert tmp_db.delete_rule(rule_id) is False
+
+
 class TestWhitelist:
     """whitelist_meta 表：add_whitelist 别名 / md5 唯一幂等 / 分页 / 删除。"""
 

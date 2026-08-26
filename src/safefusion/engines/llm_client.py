@@ -7,6 +7,9 @@
   并用定界符 <user_content> / <audit_context> 包裹用户内容；
 - 消息构建：纯文本走 text 消息；含图走多模态 content
   （PIL.Image 转 JPEG base64 Data URI；str 视为 URL 直用）；
+  ``judge`` / ``_build_messages`` 的 ``animated`` 参数携带动图多帧标记：
+  多帧动图请求（images > 1 且 animated=True）时在用户块附加多帧连贯性提示
+  （v0.2 M3，PRD §3.5 二期扩展），多张图以多个 ``image_url`` 块一次传入；
 - 输出解析：``json.loads`` + 正则提取首个 JSON 对象，字段校验
   （is_violation 必须为 bool，confidence clamp 到 0~1）；
 - 失败（坏 JSON / 异常 / 超时）按 ``max_retry`` 重试，全部失败返回 None。
@@ -65,6 +68,10 @@ _WS_RE = re.compile(r"\s{2,}")
 
 #: JSON 对象提取（贪婪到最后一个右花括号，用于解析失败时的容错）
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+#: 动图多帧连贯性提示（v0.2 M3 / PRD §3.5 二期扩展）：多帧动图请求时
+#: 附加到用户块，提醒模型关注帧间动作连贯性与上下文（固定提示，非用户内容）
+_MULTI_FRAME_PROMPT = "分析以下从动图中抽取的连续帧，注意动作连贯性与上下文。"
 
 
 def sanitize_text(text: str | None) -> str:
@@ -178,19 +185,26 @@ class LLMClient:
         text: str | None,
         images: list[Image.Image | str],
         context: str | None,
+        *,
+        animated: bool = False,
     ) -> list[dict[str, Any]]:
         """构建 chat 消息列表：纯文本用 text 消息；含图用多模态 content。
 
         Args:
             text: 待审核文本，可为 None。
             images: 图片列表；PIL.Image 编码为 JPEG base64 Data URI，
-                str 视为图片 URL 直用，其它类型跳过并告警。
+                str 视为图片 URL 直用，其它类型跳过并告警。多张图以多个
+                ``image_url`` 块一次传入（支持动图多帧）。
             context: 审核上下文，可为 None。
+            animated: 是否为动图多帧请求；为 True 且 images > 1 时在用户块
+                附加 :data:`_MULTI_FRAME_PROMPT` 多帧连贯性提示。
 
         Returns:
             [system, user] 消息列表。
         """
         user_block = self._build_user_block(text, context)
+        if animated and len(images) > 1:
+            user_block = f"{_MULTI_FRAME_PROMPT}\n{user_block}"
         if not images:
             return [
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -205,9 +219,7 @@ class LLMClient:
             elif isinstance(image, str):
                 content.append({"type": "image_url", "image_url": {"url": image}})
             else:
-                self._logger.warning(
-                    "judge: 忽略不支持的图片输入类型: %s", type(image).__name__
-                )
+                self._logger.warning("judge: 忽略不支持的图片输入类型: %s", type(image).__name__)
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": content},
@@ -277,6 +289,7 @@ class LLMClient:
         context: str | None,
         *,
         cache_hint: str | None = None,
+        animated: bool = False,
     ) -> dict[str, Any] | None:
         """执行一次 LLM 兜底审核；成功返回判定字典，失败返回 None。
 
@@ -286,35 +299,32 @@ class LLMClient:
 
         Args:
             text: 待审核文本，可为 None（纯图片请求）。
-            images: 图片列表（PIL.Image 或 str URL）。
+            images: 图片列表（PIL.Image 或 str URL）；动图多帧时逐帧传入，
+                配合 ``animated=True`` 在用户块附加多帧连贯性提示。
             context: 审核上下文，可为 None。
             cache_hint: 缓存提示（如缓存键），仅用于日志透传。
+            animated: 是否为动图多帧请求（编排层按「输入展开出多帧」判定）；
+                True 时 ``_build_messages`` 注入 :data:`_MULTI_FRAME_PROMPT`。
 
         Returns:
             判定字典 ``{"is_violation", "category", "confidence", "reason"}``，
             或 None（不可用 / 无内容 / 重试后仍失败）。
         """
         if not self.available:
-            self._logger.warning(
-                "judge: LLM 客户端不可用，跳过（cache_hint=%s）", cache_hint
-            )
+            self._logger.warning("judge: LLM 客户端不可用，跳过（cache_hint=%s）", cache_hint)
             return None
         if self._client is None:
             self._client = self._get_client()
 
         if not sanitize_text(text) and not images:
-            self._logger.warning(
-                "judge: 文本与图片均为空，跳过（cache_hint=%s）", cache_hint
-            )
+            self._logger.warning("judge: 文本与图片均为空，跳过（cache_hint=%s）", cache_hint)
             return None
 
-        messages = self._build_messages(text, images, context)
+        messages = self._build_messages(text, images, context, animated=animated)
         create_kwargs: dict[str, Any] = {"model": self._model, "messages": messages}
         if self._temperature is not None:
             create_kwargs["temperature"] = self._temperature
-        self._logger.debug(
-            "judge: 调用 LLM cache_hint=%s messages=%d", cache_hint, len(messages)
-        )
+        self._logger.debug("judge: 调用 LLM cache_hint=%s messages=%d", cache_hint, len(messages))
 
         total = self._max_retry + 1
         for attempt in range(total):
@@ -329,9 +339,7 @@ class LLMClient:
             verdict = self._parse_response(content)
             if verdict is not None:
                 return verdict
-            self._logger.warning(
-                "judge: JSON 解析失败（第 %d/%d 次）", attempt + 1, total
-            )
+            self._logger.warning("judge: JSON 解析失败（第 %d/%d 次）", attempt + 1, total)
         self._logger.warning(
             "judge: LLM 判定失败，重试 %d 次后放弃（cache_hint=%s）",
             self._max_retry,

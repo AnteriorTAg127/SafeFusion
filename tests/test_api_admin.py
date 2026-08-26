@@ -197,6 +197,165 @@ class TestKeywordsEndpoints:
         assert client.delete(f"/admin/keywords/{keyword_id}", headers=_headers()).status_code == 404
 
 
+class TestRulesEndpoints:
+    """规则 CRUD（PRD v0.2 M4）：JSON 批量 / CSV 导入 / 列表 / 删除 / 启停 / reload 钩子。"""
+
+    def test_auth_required(self, admin_env) -> None:
+        _, client = admin_env
+        assert client.get("/admin/rules").status_code == 401
+
+    def test_post_json_and_hook_called(self, tmp_path: Path) -> None:
+        calls: list[str] = []
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(
+            db,
+            matcher,
+            reload_hook=lambda: calls.append("reload") or True,
+            config=_DuckCfg(tmp_path, TOKEN),
+        )
+        client = TestClient(app)
+        resp = client.post(
+            "/admin/rules",
+            json=[{"category": "广告", "pattern": "加我好友", "action": "exempt", "note": "天气"}],
+            headers=_headers(),
+        )
+        body = resp.json()
+        assert body["inserted"] == 1
+        assert body["skipped"] == 0
+        assert body["reload"] == "ok"
+        assert calls == ["reload"]
+        assert len(db.list_rules()) == 1
+        db.close()
+
+    def test_post_json_action_default_exempt(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(db, matcher, config=_DuckCfg(tmp_path, TOKEN))
+        client = TestClient(app)
+        resp = client.post(
+            "/admin/rules",
+            json=[{"category": "广告", "pattern": "加我好友"}],
+            headers=_headers(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["reload"] == "skipped"  # 未注入 hook
+        assert db.list_rules()[0]["action"] == "exempt"
+        db.close()
+
+    def test_post_json_invalid_action_400(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(db, matcher, config=_DuckCfg(tmp_path, TOKEN))
+        client = TestClient(app)
+        resp = client.post(
+            "/admin/rules",
+            json=[{"category": "广告", "pattern": "x", "action": "ban"}],
+            headers=_headers(),
+        )
+        assert resp.status_code == 400
+        assert db.list_rules() == []  # 批量整体拒绝，未写入
+        db.close()
+
+    def test_post_csv_import_empty_action_exempt(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(db, matcher, config=_DuckCfg(tmp_path, TOKEN))
+        client = TestClient(app)
+        csv_text = "category,pattern,action\n广告,加我好友,\n色情,裸聊,violate\n"
+        resp = client.post(
+            "/admin/rules",
+            files={"file": ("rules.csv", csv_text, "text/csv")},
+            headers=_headers(),
+        )
+        body = resp.json()
+        assert body["inserted"] == 2
+        assert body["skipped"] == 0
+        rows = db.list_rules()
+        assert {r["action"] for r in rows} == {"exempt", "violate"}
+        assert next(r for r in rows if r["pattern"] == "加我好友")["action"] == "exempt"
+        db.close()
+
+    def test_get_list_filter_and_active(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(db, matcher, config=_DuckCfg(tmp_path, TOKEN))
+        client = TestClient(app)
+        db.add_rules([("色情", "裸聊", "violate", None), (None, "天气", "exempt", None)])
+        resp = client.get("/admin/rules", headers=_headers())
+        body = resp.json()
+        assert body["total"] == 2
+        assert all(item["is_active"] is True for item in body["items"])
+        filtered = client.get("/admin/rules?category=色情", headers=_headers()).json()
+        assert filtered["total"] == 1
+        assert filtered["items"][0]["pattern"] == "裸聊"
+        db.close()
+
+    def test_patch_active_disables(self, tmp_path: Path) -> None:
+        calls: list[str] = []
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(
+            db,
+            matcher,
+            reload_hook=lambda: calls.append("reload") or True,
+            config=_DuckCfg(tmp_path, TOKEN),
+        )
+        client = TestClient(app)
+        db.add_rules([("色情", "裸聊", "violate", None)])
+        rule_id = db.list_rules()[0]["id"]
+        resp = client.patch(
+            f"/admin/rules/{rule_id}/active", json={"active": False}, headers=_headers()
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"id": rule_id, "active": False, "reload": "ok"}
+        assert db.list_rules(active_only=True) == []
+        missing = client.patch("/admin/rules/999/active", json={"active": True}, headers=_headers())
+        assert missing.status_code == 404
+        db.close()
+
+    def test_delete_rule_and_hook(self, tmp_path: Path) -> None:
+        calls: list[str] = []
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(
+            db,
+            matcher,
+            reload_hook=lambda: calls.append("reload") or True,
+            config=_DuckCfg(tmp_path, TOKEN),
+        )
+        client = TestClient(app)
+        db.add_rules([("色情", "裸聊", "violate", None)])
+        rule_id = db.list_rules()[0]["id"]
+        resp = client.delete(f"/admin/rules/{rule_id}", headers=_headers())
+        assert resp.status_code == 200
+        assert resp.json() == {"deleted": rule_id, "reload": "ok"}
+        assert db.list_rules() == []
+        assert calls == ["reload"]  # 仅删除触发一次（规则经 DAO 直插，不走端点）
+        assert client.delete(f"/admin/rules/{rule_id}", headers=_headers()).status_code == 404
+        db.close()
+
+    def test_reload_hook_failure_reported(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        app = create_admin_app(
+            db,
+            matcher,
+            reload_hook=lambda: False,
+            config=_DuckCfg(tmp_path, TOKEN),
+        )
+        client = TestClient(app)
+        resp = client.post(
+            "/admin/rules",
+            json=[{"pattern": "x", "action": "exempt"}],
+            headers=_headers(),
+        )
+        # 写入成功但热重载失败 → 响应标注 failed
+        assert resp.json()["inserted"] == 1
+        assert resp.json()["reload"] == "failed"
+        db.close()
+
+
 class TestWhitelistEndpoints:
     """白名单上传（multipart）/ 列表 / 删除；上传后命中距离 0。"""
 

@@ -1,4 +1,4 @@
-"""管理 API（:8001，PRD §4.2）：Key / 词库 / 图片白名单 / 审核日志 / 向量重建。
+"""管理 API（:8001，PRD §4.2）：Key / 词库 / 正则规则 / 图片白名单 / 审核日志 / 向量重建。
 
 设计要点：
 - 认证：全部 ``/admin/*`` 经路由器级依赖要求 ``X-Admin-Token`` 头与启动时解析的
@@ -10,6 +10,9 @@
 - 存储解耦：只依赖 T2 ``Database`` 已实现的方法；keys 的删除与备注更新所需
   ``Database.delete_key`` / ``Database.update_key_note`` 当前缺失，采用鸭子类型
   探测，缺失时返回 501（Not Implemented）并给出中文错误，不静默失败。
+- 正则消歧规则（PRD v0.2 M4）：``POST /admin/rules`` 接受 JSON 数组或 multipart
+  CSV，写库后调用注入的 ``reload_hook``（通常为 ``AppContext.reload_rules``）
+  热重载即时生效；未注入时端点正常返回但响应含 ``"reload": "skipped"``。
 - 图片白名单文件持久化于 ``config.data_dir/whitelist/``（缺省 ``./data/whitelist/``），
   以 ``{md5}.png`` 命名 —— md5 取 PNG 编码字节（与 ``compute_hashes`` 一致），
   故磁盘文件内容哈希与入库 md5 相等，删除时可按 md5 定位文件。
@@ -42,6 +45,7 @@ from starlette.concurrency import run_in_threadpool
 
 from safefusion import __version__
 from safefusion.api.dependencies import Page, pagination, require_admin_token
+from safefusion.core.review import ReviewScheduler
 from safefusion.engines.image_pipeline import WhitelistMatcher, compute_hashes, decode_images
 from safefusion.logging_setup import get_logger
 from safefusion.models.schemas import ImageInput
@@ -104,6 +108,12 @@ class RebuildBody(BaseModel):
             "归一化清单路径（scripts/normalize_assets.py 产出）；缺省取 data/vectors/manifest.jsonl"
         ),
     )
+
+
+class RuleActivePatch(BaseModel):
+    """PATCH /admin/rules/{rule_id}/active 请求体。"""
+
+    active: bool = Field(description="True=启用 / False=停用（停用后规则不参与消歧）")
 
 
 def _resolve_admin_token(config: Any) -> str:
@@ -175,6 +185,112 @@ def _parse_keywords_txt(text: str, category: str) -> list[tuple[str, str, str]]:
     return items
 
 
+#: 规则 CSV 表头行（中英文均可，逐行判定跳过）
+_RULES_CSV_HEADERS: tuple[tuple[str, str], ...] = (
+    ("category", "pattern"),
+    ("类别", "规则"),
+    ("类别", "pattern"),
+)
+
+
+def _parse_rules_csv(text: str) -> list[dict[str, Any]]:
+    """解析规则 CSV（category,pattern,action 三列）。
+
+    跳过空行 / 表头行 / 空 pattern 行；action 列缺省或为空时默认 ``exempt``；
+    category 可为空（规则不限定类别，作用于全部命中）。
+
+    Args:
+        text: CSV 原文（UTF-8，可带 BOM）。
+
+    Returns:
+        规范化后的规则字典列表（category / pattern / action / note）。
+    """
+
+    items: list[dict[str, Any]] = []
+    head = True
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 2:
+            continue
+        category, pattern = row[0].strip(), row[1].strip()
+        if not pattern:
+            continue
+        if head and (category, pattern) in _RULES_CSV_HEADERS:
+            head = False
+            continue
+        head = False
+        action = row[2].strip() if len(row) > 2 else ""
+        items.append(
+            {
+                "category": category,
+                "pattern": pattern,
+                "action": action or "exempt",
+                "note": None,
+            }
+        )
+    return items
+
+
+def _normalize_rule_items(payload: list[Any]) -> list[dict[str, Any]]:
+    """JSON 规则数组规范化：缺失 / 空 action 默认 ``exempt``，空 pattern 剔除。
+
+    Args:
+        payload: JSON 数组（元素为规则对象字典）。
+
+    Returns:
+        规范化后的规则字典列表（category / pattern / action / note）。
+
+    Raises:
+        HTTPException(400): 数组元素不是对象字典（API 误用，不静默跳过）。
+    """
+
+    items: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="JSON 规则数组元素必须是对象字典")
+        pattern = str(item.get("pattern") or "").strip()
+        if not pattern:
+            continue
+        action = str(item.get("action") or "").strip() or "exempt"
+        items.append(
+            {
+                "category": str(item.get("category") or "").strip(),
+                "pattern": pattern,
+                "action": action,
+                "note": item.get("note"),
+            }
+        )
+    return items
+
+
+async def _run_reload_hook(hook: Callable[[], Any] | None) -> str:
+    """调用注入的热重载钩子并归类结果：``ok`` / ``failed`` / ``skipped``（未注入）。
+
+    同步钩子在线程池执行（避免阻塞事件循环），异步钩子直接 await；
+    钩子抛异常或显式返回 False（热重载失败回退旧实例）时归类为 ``failed``，
+    但端点本身仍正常返回（不因规则层刷新失败而回绝已落库的写操作）。
+
+    Args:
+        hook: 注入的热重载回调（通常为 ``AppContext.reload_rules``）。
+
+    Returns:
+        ``ok`` / ``failed`` / ``skipped``。
+    """
+
+    if hook is None:
+        return "skipped"
+    try:
+        if inspect.iscoroutinefunction(hook):
+            result = await hook()
+        else:
+            result = await run_in_threadpool(hook)
+        if inspect.isawaitable(result):
+            result = await result
+        return "ok" if result is not False else "failed"
+    except Exception as exc:
+        logger.warning("规则热重载钩子执行失败（响应仍正常返回）: %r", exc)
+        return "failed"
+
+
 def _normalize_log(row: dict[str, Any]) -> dict[str, Any]:
     """审核记录行转 API 形态：has_violation 转 bool、detail_json 解析为 detail。"""
 
@@ -195,7 +311,9 @@ def create_admin_app(
     db: Database,
     whitelist_matcher: WhitelistMatcher,
     rebuild_hook: Callable[[str], Any] | None = None,
+    reload_hook: Callable[[], Any] | None = None,
     config: Any = None,
+    reviewer: ReviewScheduler | None = None,
 ) -> FastAPI:
     """创建管理 API 应用（FastAPI，部署时挂载于 :8001）。
 
@@ -204,11 +322,17 @@ def create_admin_app(
         whitelist_matcher: T4 图片白名单匹配器（``WhitelistMatcher``，已在构造时注入 db）。
         rebuild_hook: 向量库重建回调，接收归一化清单路径字符串；可为同步或异步函数；
             未注入时 ``POST /admin/vectors/rebuild`` 返回 501。
+        reload_hook: 词库/规则热重载回调（PRD v0.2 M4），通常注入
+            ``AppContext.reload_rules``；可为同步或异步函数；未注入时规则写
+            入端点正常返回但响应含 ``"reload": "skipped"``。
         config: 应用配置（``AppConfig``，或提供 ``data_dir`` / ``admin_token`` 属性的
             鸭子类型）；为 None 时白名单目录与默认清单取 ``./data`` 下。
+        reviewer: 定时复核调度器（PRD v0.2 M7，``core.review.ReviewScheduler``）；
+            未注入时 ``POST /admin/review/run`` 与 ``GET /admin/review/status``
+            返回 501。
 
     Returns:
-        已注册五组端点与全局异常处理器（脱敏 JSON）的 FastAPI 实例。
+        已注册六组端点与全局异常处理器（脱敏 JSON）的 FastAPI 实例。
     """
 
     token = _resolve_admin_token(config)
@@ -218,7 +342,7 @@ def create_admin_app(
     app = FastAPI(
         title="SafeFusion 管理 API",
         version=__version__,
-        description="PRD §4.2：Key / 词库 / 白名单 / 日志 / 向量重建。端点需 X-Admin-Token。",
+        description="PRD §4.2：Key / 词库 / 规则 / 白名单 / 日志 / 向量重建（需 X-Admin-Token）",
     )
     router = APIRouter(
         prefix="/admin",
@@ -328,6 +452,136 @@ def create_admin_app(
         if not db.delete_keyword(keyword_id):
             raise HTTPException(status_code=404, detail=f"词条不存在: id={keyword_id}")
         return {"deleted": keyword_id}
+
+    # ------------------------------------------------------------- rules
+    @router.get("/rules")
+    async def list_rules(
+        category: Annotated[
+            str | None, Query(description="按类别过滤；缺省返回全部（含无类别规则）")
+        ] = None,
+        active_only: Annotated[
+            bool, Query(description="仅返回启用规则；false 返回全部（含已停用）")
+        ] = True,
+    ) -> dict[str, Any]:
+        """列出正则消歧规则（PRD v0.2 M4）：可按类别 / 启用状态过滤。"""
+
+        rows = db.list_rules(category, active_only=active_only)
+        return {
+            "total": len(rows),
+            "items": [{**row, "is_active": bool(row["is_active"])} for row in rows],
+        }
+
+    @router.post("/rules")
+    async def add_rules(request: Request) -> dict[str, Any]:
+        """批量新增正则消歧规则（PRD v0.2 M4）。
+
+        支持两种请求体：JSON 数组 ``[{category, pattern, action, note}]``
+        （action 缺省为 exempt）；multipart ``file`` 字段上传 CSV
+        （``category,pattern,action`` 三列，action 空默认 exempt，表头行自动
+        跳过）。重复规则（category+pattern+action 唯一）跳过并计数；写库成功后
+        调用注入的 reload 钩子（未注入时响应含 ``"reload": "skipped"``）。
+        """
+
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file")
+            if upload is None or not hasattr(upload, "read"):
+                raise HTTPException(status_code=400, detail="CSV 导入需提供 file 字段（multipart）")
+            raw = await upload.read()
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(
+                    status_code=400, detail="文件编码不支持：仅接受 UTF-8（可带 BOM）"
+                ) from exc
+            items = _parse_rules_csv(text)
+        else:
+            try:
+                payload = json.loads(await request.body())
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise HTTPException(
+                    status_code=400, detail="请求体必须是 JSON 数组或 multipart CSV"
+                ) from exc
+            if not isinstance(payload, list):
+                raise HTTPException(status_code=400, detail="JSON 请求体必须是规则对象数组")
+            items = _normalize_rule_items(payload)
+        try:
+            inserted, skipped = db.add_rules(
+                [
+                    (item["category"], item["pattern"], item["action"], item["note"])
+                    for item in items
+                ]
+            )
+        except ValueError as exc:  # action 非法 / 无效正则，批量整体拒绝
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "inserted": inserted,
+            "skipped": skipped,
+            "total": inserted + skipped,
+            "reload": await _run_reload_hook(reload_hook),
+        }
+
+    @router.delete("/rules/{rule_id}")
+    async def delete_rule(rule_id: int) -> dict[str, Any]:
+        """按主键删除规则；不存在返回 404。删除成功后调用热重载钩子即时生效。"""
+
+        if not db.delete_rule(rule_id):
+            raise HTTPException(status_code=404, detail=f"规则不存在: id={rule_id}")
+        return {"deleted": rule_id, "reload": await _run_reload_hook(reload_hook)}
+
+    @router.patch("/rules/{rule_id}/active")
+    async def set_rule_active(rule_id: int, body: RuleActivePatch) -> dict[str, Any]:
+        """启用 / 停用规则；不存在返回 404。状态变更后调用热重载钩子即时生效。"""
+
+        if not db.set_rule_active(rule_id, body.active):
+            raise HTTPException(status_code=404, detail=f"规则不存在: id={rule_id}")
+        return {
+            "id": rule_id,
+            "active": body.active,
+            "reload": await _run_reload_hook(reload_hook),
+        }
+
+    # ------------------------------------------------------------- review
+    @router.post("/review/run")
+    async def run_review() -> dict[str, Any]:
+        """手动触发一轮定时复核（PRD v0.2 M7）。
+
+        - 未注入 reviewer（集成方未装配调度器）→ 501；
+        - 已有复核在执行（自动轮次或并发触发）→ 202 Accepted（本次触发忽略，
+          可轮询 ``/admin/review/status`` 获取最新报告）；
+        - 正常执行 → 200 + 报告摘要（含 ``skipped_reason``，如
+          ``llm_unavailable`` / ``text_unavailable`` / ``no_samples``）。
+        """
+
+        if reviewer is None:
+            raise HTTPException(
+                status_code=501,
+                detail="定时复核暂不可用：未注入 reviewer（缺少数据库或 LLM 组件）",
+            )
+        report = await reviewer.trigger()
+        if report is None:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "running",
+                    "message": "复核已在执行中，本次手动触发已忽略",
+                    "status_detail": reviewer.status(),
+                },
+            )
+        return {"status": "ok", "summary": report.as_dict()}
+
+    @router.get("/review/status")
+    async def review_status() -> dict[str, Any]:
+        """查询定时复核状态（PRD v0.2 M7）：启用 / 间隔 / 运行中 / 上次运行时间 /
+        最近报告 / 报告目录。未注入 reviewer 时返回 501。"""
+
+        if reviewer is None:
+            raise HTTPException(
+                status_code=501,
+                detail="定时复核暂不可用：未注入 reviewer（缺少数据库或 LLM 组件）",
+            )
+        return reviewer.status()
 
     # ------------------------------------------------------ whitelist images
     @router.post("/whitelist/images")

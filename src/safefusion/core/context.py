@@ -6,7 +6,8 @@
   ``NumpyVectorStore``（``data_dir/vectors`` 下有 ``black.npz`` / ``white.npz``
   则 load，否则构造空库并确保 save 目录存在）；
 - 基础组件：``CacheLayer``（config.cache 的 dict 形态）、``KeywordEngine``
-  （从 Database.list_keywords 加载词库，空词库正常）、``LightTextModel``
+  （从 Database.list_keywords 加载词库 + ``config.keyword.regex_rules_enabled``
+  开启时从 rules 表加载正则消歧规则，空词库/空规则正常）、``LightTextModel``
   （model_path/config_path 为 None 或缺文件时 disabled）、
   ``WhitelistMatcher``（注入 Database 实例）；
 - 多模态组件：``get_embedding_backend``（local 缺 torch / cloud 缺 Key 抛
@@ -110,7 +111,17 @@ class AppContext:
                 categories: dict[str, list[str]] = {}
                 for row in rows:
                     categories.setdefault(row["category"], []).append(row["word"])
-                keyword_engine.load_categories(categories)
+                # 正则消歧规则（PRD v0.2 M4）：开关开启时从 rules 表加载
+                # （可为空表），关闭时规则层整体跳过（disambiguate 透传）
+                rules: list[dict] | None = None
+                if config.keyword.regex_rules_enabled:
+                    rules = database.list_rules(active_only=True)
+                try:
+                    keyword_engine.reload(categories, rules)
+                except ValueError as exc:
+                    # 规则表存在引擎无法编译的条目：词库照常加载，规则层降级关闭
+                    _logger.warning("正则规则加载失败（本次启动规则层关闭，词库正常）: %s", exc)
+                    keyword_engine.reload(categories, None)
         except Exception as exc:
             _logger.warning("KeywordEngine 装配失败（降级为 None）: %s", exc)
             keyword_engine = None
@@ -160,9 +171,10 @@ class AppContext:
         semantic: SemanticEngine | None = None
         if embedding is not None and store is not None:
             try:
-                semantic = SemanticEngine(
-                    embedding, store, thresholds=config.thresholds.model_dump()
-                )
+                # thresholds 合并 config.semantic（rerank 四信号权重等 v0.2 键），
+                # 保证 Rerank 开关经配置即生效（T19 交接接线，主模型 2026-08-26）。
+                sem_th = {**config.thresholds.model_dump(), **config.semantic.model_dump()}
+                semantic = SemanticEngine(embedding, store, thresholds=sem_th)
             except Exception as exc:
                 _logger.warning("SemanticEngine 装配失败（降级为 None）: %s", exc)
                 semantic = None
@@ -198,3 +210,54 @@ class AppContext:
             cache_layer=cache_layer,
             degraded=degraded,
         )
+
+    # ------------------------------------------- 热重载（PRD v0.2 M4，免重启）
+
+    def reload_keywords(self) -> bool:
+        """从数据库重新加载词库 + 正则规则到 KeywordEngine 并原子替换（热重载）。
+
+        供管理端写入词库 / 规则后调用，免重启即时生效；规则层是否参与由
+        ``config.keyword.regex_rules_enabled`` 决定。词库 / 规则在锁外构建、
+        锁内一次性替换（``KeywordEngine.reload`` 原子语义）：重载失败时旧实例
+        继续生效，本方法不抛异常。
+
+        Returns:
+            True = 已成功原子替换；False = 引擎未装配 / 数据库不可用 / 重载
+            失败（旧实例继续生效）。
+        """
+
+        if self.keyword_engine is None or self.database is None:
+            return False
+        try:
+            categories: dict[str, list[str]] = {}
+            for row in self.database.list_keywords():
+                categories.setdefault(row["category"], []).append(row["word"])
+            rules = self._load_rules_rows()
+            self.keyword_engine.reload(categories, rules)
+        except Exception as exc:
+            _logger.warning("关键词热重载失败（保留旧实例）: %s", exc)
+            return False
+        return True
+
+    def reload_rules(self) -> bool:
+        """仅重载正则消歧规则（词库一并从数据库刷新，复用 :meth:`reload_keywords`）。
+
+        Returns:
+            同 :meth:`reload_keywords`。
+        """
+
+        return self.reload_keywords()
+
+    def _load_rules_rows(self) -> list[dict] | None:
+        """按配置开关读取 rules 表活性规则行。
+
+        Returns:
+            规则行列表；``regex_rules_enabled=False`` 或数据库不可用时返回
+            None（规则层关闭）。
+        """
+
+        if self.config is None or not self.config.keyword.regex_rules_enabled:
+            return None
+        if self.database is None:
+            return None
+        return self.database.list_rules(active_only=True)

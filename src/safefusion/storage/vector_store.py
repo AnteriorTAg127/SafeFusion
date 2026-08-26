@@ -165,9 +165,7 @@ class NumpyVectorStore(BaseVectorStore):
                 new_state[pool] = self._merge_pool(pool, chunk, new_state.get(pool))
             self._state = new_state
 
-    def _merge_pool(
-        self, pool: str, chunk: list[VectorItem], old: _PoolData | None
-    ) -> _PoolData:
+    def _merge_pool(self, pool: str, chunk: list[VectorItem], old: _PoolData | None) -> _PoolData:
         """将一批条目并入一个池，返回新的不可变快照（不修改旧快照）。
 
         池内已存在的 id 跳过并告警（幂等导入不重复、不覆盖）。
@@ -242,8 +240,7 @@ class NumpyVectorStore(BaseVectorStore):
                 heapq.heapreplace(heap, (score, idx))
         heap.sort(reverse=True)
         return [
-            SearchHit(data.ids[idx], score, dict(data.meta[data.ids[idx]]))
-            for score, idx in heap
+            SearchHit(data.ids[idx], score, dict(data.meta[data.ids[idx]])) for score, idx in heap
         ]
 
     def save(self) -> None:

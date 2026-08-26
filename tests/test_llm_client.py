@@ -248,3 +248,46 @@ class TestMessageBuilding:
         msgs = client._build_messages("text", [12345], None)
         # 只有 text 部分，非法类型被跳过并告警
         assert len(msgs[1]["content"]) == 1
+
+
+class TestAnimatedMultiFramePrompt:
+    """动图多帧连贯性提示（v0.2 M3）：animated=True 且多图时注入提示词。"""
+
+    def test_animated_multi_frame_prompt_added(self) -> None:
+        from PIL import Image
+
+        client = _client(api_key=None)
+        imgs = [Image.new("RGB", (4, 4)), Image.new("RGB", (4, 4))]
+        msgs = client._build_messages("待审", imgs, None, animated=True)
+        content = msgs[1]["content"]
+        assert content[0]["type"] == "text"
+        assert "分析以下从动图中抽取的连续帧" in content[0]["text"]
+        # 两张图以两个 image_url 块一次传入
+        assert len([p for p in content if p["type"] == "image_url"]) == 2
+
+    def test_animated_single_image_no_prompt(self) -> None:
+        from PIL import Image
+
+        client = _client(api_key=None)
+        msgs = client._build_messages("待审", [Image.new("RGB", (4, 4))], None, animated=True)
+        assert "连续帧" not in msgs[1]["content"][0]["text"]
+
+    def test_multi_image_without_animated_no_prompt(self) -> None:
+        from PIL import Image
+
+        client = _client(api_key=None)
+        imgs = [Image.new("RGB", (4, 4)), Image.new("RGB", (4, 4))]
+        msgs = client._build_messages("待审", imgs, None, animated=False)
+        assert "连续帧" not in msgs[1]["content"][0]["text"]
+
+    async def test_judge_animated_prompt_on_wire(self) -> None:
+        from PIL import Image
+
+        client = _client()
+        client._client = _FakeClient([_resp('{"is_violation": true}')])  # noqa: SLF001
+        imgs = [Image.new("RGB", (4, 4)), Image.new("RGB", (4, 4))]
+        await client.judge("内容", imgs, None, animated=True)
+        msgs = client._client.create_kwargs[0]["messages"]  # noqa: SLF001
+        user_content = msgs[1]["content"]
+        assert "分析以下从动图中抽取的连续帧" in user_content[0]["text"]
+        assert len([p for p in user_content if p["type"] == "image_url"]) == 2

@@ -15,9 +15,7 @@ Source = Literal["semantic", "llm", "basic_rules_pass", "cache", "permanent_list
 class ImageInput(BaseModel):
     """输入图片：``url`` 与 ``base64`` 二选一。"""
 
-    url: str | None = Field(
-        default=None, description="图片 URL（http/https），与 base64 二选一"
-    )
+    url: str | None = Field(default=None, description="图片 URL（http/https），与 base64 二选一")
     base64: str | None = Field(
         default=None, description="图片 base64 编码（不含 data: 前缀），与 url 二选一"
     )
@@ -40,29 +38,21 @@ class Overrides(BaseModel):
     margin_w: float | None = Field(
         default=None, description="黑均分−白均分差值的 margin 比较基准覆盖"
     )
-    confidence_low: float | None = Field(
-        default=None, description="置信度低档上界覆盖"
-    )
-    confidence_high: float | None = Field(
-        default=None, description="置信度高档下界覆盖"
-    )
+    confidence_low: float | None = Field(default=None, description="置信度低档上界覆盖")
+    confidence_high: float | None = Field(default=None, description="置信度高档下界覆盖")
 
 
 class AuditRequest(BaseModel):
     """审核请求体（POST /v1/audit）。"""
 
-    text: str | None = Field(
-        default=None, description="待检测文本，可为空或 None（纯图片请求）"
-    )
+    text: str | None = Field(default=None, description="待检测文本，可为空或 None（纯图片请求）")
     images: list[ImageInput] = Field(
         default_factory=list, description="输入图片列表（v0.1 仅静态图），可为空"
     )
     context: str | None = Field(
         default=None, description="审核上下文，仅注入 LLM 提示，不参与其他层"
     )
-    skip_llm: bool = Field(
-        default=False, description="跳过 LLM 兜底层（强制回退语义层结果）"
-    )
+    skip_llm: bool = Field(default=False, description="跳过 LLM 兜底层（强制回退语义层结果）")
     overrides: Overrides | None = Field(
         default=None, description="请求级参数覆盖（仅 full 组 Key 可用）"
     )
@@ -90,9 +80,7 @@ class RegexFilteredHit(BaseModel):
 class KeywordDetail(BaseModel):
     """关键词层明细。"""
 
-    hits: list[KeywordHitModel] = Field(
-        default_factory=list, description="保留的关键词命中列表"
-    )
+    hits: list[KeywordHitModel] = Field(default_factory=list, description="保留的关键词命中列表")
     regex_filtered: list[RegexFilteredHit] = Field(
         default_factory=list, description="被正则消歧豁免的命中及原因"
     )
@@ -149,18 +137,12 @@ class LLMDetail(BaseModel):
 class AuditDetail(BaseModel):
     """审核结果明细（full 组 API Key 返回，standard 组为 None）。"""
 
-    keyword: KeywordDetail | None = Field(
-        default=None, description="关键词命中与正则消歧结果"
-    )
-    light_model: LightModelResult | None = Field(
-        default=None, description="轻量文本风险模型输出"
-    )
+    keyword: KeywordDetail | None = Field(default=None, description="关键词命中与正则消歧结果")
+    light_model: LightModelResult | None = Field(default=None, description="轻量文本风险模型输出")
     image_whitelist: list[ImageWhitelistHit] | None = Field(
         default=None, description="各帧白名单检查结果"
     )
-    semantic: SemanticDetail | None = Field(
-        default=None, description="语义检索层结果"
-    )
+    semantic: SemanticDetail | None = Field(default=None, description="语义检索层结果")
     llm: LLMDetail | None = Field(default=None, description="LLM 兜底层结果")
 
 
@@ -171,15 +153,11 @@ class AuditResult(BaseModel):
     timestamp: str = Field(description="审核完成时间（ISO 8601）")
     has_violation: bool = Field(description="是否判定违规")
     confidence: float = Field(description="综合置信度（0~1）")
-    category: str | None = Field(
-        default=None, description="判定类别（违规时给出，如 色情 / 赌博）"
-    )
+    category: str | None = Field(default=None, description="判定类别（违规时给出，如 色情 / 赌博）")
     source: Source = Field(
         description="判定来源：semantic / llm / basic_rules_pass / cache / permanent_list"
     )
-    cache_hit: bool = Field(
-        default=False, description="是否命中各级缓存直接返回"
-    )
+    cache_hit: bool = Field(default=False, description="是否命中各级缓存直接返回")
     detail: AuditDetail | None = Field(
         default=None, description="审核明细（仅 full 组填充，standard 组为 None）"
     )

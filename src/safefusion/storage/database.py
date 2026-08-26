@@ -1,14 +1,15 @@
-"""SQLite 存储层：API Key / 词库 / 图片白名单 / 审核记录四类表的 DAO。
+"""SQLite 存储层：API Key / 词库 / 正则规则 / 图片白名单 / 审核记录五类表的 DAO。
 
-设计要点（对齐 PRD §5 与 开发/v0.1/分工.md T2 任务卡）：
+设计要点（对齐 PRD §5 与 开发/v0.2/分工.md T17 任务卡）：
 - 连接随实例持有（``sqlite3.Connection``），全程由单个 ``threading.Lock`` 互斥；
 - ``PRAGMA journal_mode=WAL`` + ``synchronous=NORMAL``：读不阻塞写；
 - 建表与辅助索引在构造时幂等执行（``IF NOT EXISTS``）；
 - 全部写操作显式 ``commit``；时间戳统一为 UTC ISO 8601 字符串（毫秒精度）；
-- 重复资源（Key / 词条 / 白名单 md5）一律告警而不静默覆盖。
+- 重复资源（Key / 词条 / 白名单 md5 / 规则）一律告警而不静默覆盖。
 """
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -65,13 +66,29 @@ _CREATE_TABLES: tuple[str, ...] = (
         key_tier      TEXT
     )
     """,
+    # PRD v0.2 M4：正则消歧规则库（category 为空串表示不限定类别，
+    # 作用于全部命中；同 (category, pattern, action) 判重，防重复导入）
+    """
+    CREATE TABLE IF NOT EXISTS rules (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        category   TEXT,
+        pattern    TEXT NOT NULL,
+        action     TEXT NOT NULL CHECK (action IN ('exempt', 'violate')),
+        note       TEXT,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        UNIQUE (category, pattern, action)
+    )
+    """,
 )
 
-#: 辅助索引：白名单 md5 唯一（防重复图入库）、审核日志按时间/来源查询提速
+#: 辅助索引：白名单 md5 唯一（防重复图入库）、审核日志按时间/来源查询提速、
+#: 规则按类别过滤提速
 _CREATE_INDEXES: tuple[str, ...] = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_whitelist_md5 ON whitelist_meta (md5)",
     "CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs (ts)",
     "CREATE INDEX IF NOT EXISTS idx_audit_logs_source ON audit_logs (source)",
+    "CREATE INDEX IF NOT EXISTS idx_rules_category ON rules (category)",
 )
 
 
@@ -90,7 +107,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 class Database:
-    """SQLite DAO：四张业务表的增删查改。
+    """SQLite DAO：五张业务表的增删查改。
 
     Args:
         db_path: SQLite 数据库文件路径（父目录不存在时自动创建）。
@@ -143,9 +160,7 @@ class Database:
         if tier not in _TIERS:
             raise ValueError(f"tier 必须是 {'/'.join(_TIERS)}，收到 {tier!r}")
         with self._lock:
-            exists = self._conn.execute(
-                "SELECT 1 FROM api_keys WHERE key = ?", (key,)
-            ).fetchone()
+            exists = self._conn.execute("SELECT 1 FROM api_keys WHERE key = ?", (key,)).fetchone()
             if exists is not None:
                 _logger.warning("API Key 重复创建被拒绝（不覆盖）")
                 raise ValueError(f"API Key 已存在: {key}")
@@ -161,8 +176,7 @@ class Database:
 
         with self._lock:
             rows = self._conn.execute(
-                "SELECT key, tier, enabled, note, created_at FROM api_keys "
-                "ORDER BY created_at, key"
+                "SELECT key, tier, enabled, note, created_at FROM api_keys ORDER BY created_at, key"
             ).fetchall()
             return [_row_to_dict(row) for row in rows]
 
@@ -188,9 +202,7 @@ class Database:
         """
 
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM api_keys WHERE key = ?", (key,)
-            )
+            cursor = self._conn.execute("DELETE FROM api_keys WHERE key = ?", (key,))
             self._conn.commit()
             return cursor.rowcount > 0
 
@@ -202,9 +214,7 @@ class Database:
         """
 
         with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE api_keys SET note = ? WHERE key = ?", (note, key)
-            )
+            cursor = self._conn.execute("UPDATE api_keys SET note = ? WHERE key = ?", (note, key))
             self._conn.commit()
             return cursor.rowcount > 0
 
@@ -224,9 +234,7 @@ class Database:
 
     # -------------------------------------------------------------- keywords
 
-    def add_keywords(
-        self, items: Sequence[tuple[str, str, str | None]]
-    ) -> tuple[int, int]:
+    def add_keywords(self, items: Sequence[tuple[str, str, str | None]]) -> tuple[int, int]:
         """批量新增词条。
 
         Args:
@@ -241,8 +249,7 @@ class Database:
             return (0, 0)
         with self._lock:
             cursor = self._conn.executemany(
-                "INSERT OR IGNORE INTO keywords (category, word, source) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO keywords (category, word, source) VALUES (?, ?, ?)",
                 items,
             )
             self._conn.commit()
@@ -273,8 +280,114 @@ class Database:
         """
 
         with self._lock:
+            cursor = self._conn.execute("DELETE FROM keywords WHERE id = ?", (keyword_id,))
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------ rules
+
+    def add_rules(
+        self, items: Sequence[tuple[str | None, str, str, str | None]]
+    ) -> tuple[int, int]:
+        """批量新增正则消歧规则（PRD v0.2 M4）。
+
+        Args:
+            items: ``(category, pattern, action, note)`` 四元组序列。
+                category 可为 None / 空串（规则不限定类别，作用于全部命中）；
+                action 限 ``exempt``（豁免）/ ``violate``（追加强命中）；
+                note 可为 None。规则以 ``(category, pattern, action)`` 判重，
+                重复项自动跳过并告警，不静默覆盖（与词库导入同口径）。
+
+        Returns:
+            ``(新增条数, 跳过条数)``。
+
+        Raises:
+            ValueError: action 非法、pattern 为空或不是有效正则（写入前快速
+                失败，保证 rules 表内不会留存引擎无法编译的规则）。
+        """
+
+        if not items:
+            return (0, 0)
+        for _category, pattern, action, _note in items:
+            if action not in ("exempt", "violate"):
+                raise ValueError(f"规则 action 必须为 exempt 或 violate，收到 {action!r}")
+            if not pattern:
+                raise ValueError("规则 pattern 不能为空")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"规则 pattern 不是有效正则: {pattern!r}（{exc}）") from exc
+        with self._lock:
+            cursor = self._conn.executemany(
+                "INSERT OR IGNORE INTO rules "
+                "(category, pattern, action, note, is_active, created_at) "
+                "VALUES (?, ?, ?, ?, 1, ?)",
+                [
+                    (category or "", pattern, action, note, _utc_now())
+                    for category, pattern, action, note in items
+                ],
+            )
+            self._conn.commit()
+            inserted = cursor.rowcount
+            skipped = len(items) - inserted
+            if skipped:
+                _logger.warning(
+                    "批量规则导入跳过 %d 条重复项（category+pattern+action 唯一）", skipped
+                )
+            return inserted, skipped
+
+    def list_rules(
+        self, category: str | None = None, active_only: bool = True
+    ) -> list[dict[str, Any]]:
+        """列出正则消歧规则，可按类别/启用状态过滤（按 id 升序，插入序稳定）。
+
+        Args:
+            category: 按类别过滤；None 返回全部类别（无类别规则 category 为空串）。
+            active_only: True（默认）仅返回 is_active=1 的规则；False 返回全部
+                （含已停用），供管理端核对。
+
+        Returns:
+            规则字典列表（id / category / pattern / action / note / is_active
+            （0/1） / created_at）。
+        """
+
+        sql = "SELECT id, category, pattern, action, note, is_active, created_at FROM rules"
+        conditions: list[str] = []
+        params: list[Any] = []
+        if category is not None:
+            conditions.append("category = ?")
+            params.append(category)
+        if active_only:
+            conditions.append("is_active = 1")
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            return [_row_to_dict(row) for row in rows]
+
+    def delete_rule(self, rule_id: int) -> bool:
+        """按主键删除规则。
+
+        Returns:
+            True 表示确有该规则且已删除；False 表示不存在。
+        """
+
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def set_rule_active(self, rule_id: int, active: bool) -> bool:
+        """启用 / 停用指定规则（停用后不参与消歧，但保留记录可再启用）。
+
+        Returns:
+            True 表示确有该规则且状态已更新；False 表示不存在。
+        """
+
+        with self._lock:
             cursor = self._conn.execute(
-                "DELETE FROM keywords WHERE id = ?", (keyword_id,)
+                "UPDATE rules SET is_active = ? WHERE id = ?", (int(active), rule_id)
             )
             self._conn.commit()
             return cursor.rowcount > 0
@@ -310,16 +423,13 @@ class Database:
                 _logger.warning("白名单图片 md5 已存在（id=%s），返回既有条目", existing["id"])
                 return int(existing["id"])
             cursor = self._conn.execute(
-                "INSERT INTO whitelist_meta (md5, phash_hex, note, created_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO whitelist_meta (md5, phash_hex, note, created_at) VALUES (?, ?, ?, ?)",
                 (md5, phash_hex, note, _utc_now()),
             )
             self._conn.commit()
             return int(cursor.lastrowid)
 
-    def list_whitelist(
-        self, limit: int | None = None, offset: int = 0
-    ) -> list[dict[str, Any]]:
+    def list_whitelist(self, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
         """列出白名单元数据（按 id 升序），支持分页（limit 为 None 时全量返回）。"""
 
         sql = "SELECT id, md5, phash_hex, note, created_at FROM whitelist_meta ORDER BY id"
@@ -339,9 +449,7 @@ class Database:
         """
 
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM whitelist_meta WHERE id = ?", (entry_id,)
-            )
+            cursor = self._conn.execute("DELETE FROM whitelist_meta WHERE id = ?", (entry_id,))
             self._conn.commit()
             return cursor.rowcount > 0
 
@@ -462,9 +570,7 @@ class Database:
 
         if limit < 1 or offset < 0:
             raise ValueError(f"分页参数非法: limit={limit}, offset={offset}")
-        where, params = self._log_where(
-            start_ts, end_ts, has_violation, source, category, key_tier
-        )
+        where, params = self._log_where(start_ts, end_ts, has_violation, source, category, key_tier)
         sql = (
             "SELECT request_id, ts, text_hash, has_violation, confidence, "
             "category, source, detail_json, key_tier FROM audit_logs "
@@ -485,9 +591,7 @@ class Database:
     ) -> int:
         """按与 :meth:`query_logs` 相同的过滤条件统计记录总数（用于分页）。"""
 
-        where, params = self._log_where(
-            start_ts, end_ts, has_violation, source, category, key_tier
-        )
+        where, params = self._log_where(start_ts, end_ts, has_violation, source, category, key_tier)
         with self._lock:
             row = self._conn.execute(
                 f"SELECT COUNT(*) AS n FROM audit_logs {where}", params

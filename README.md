@@ -65,7 +65,36 @@ export ADMIN_PASSWORD=...                  # 管理 API 令牌（未设置则启
 
 详见脚本 `--help`（`--node-data` / `--cherry-data` / `--out` / `--max-rows` 均可配）。
 
-### 4. 运行服务（v0.1 待 T10/T11 集成）
+### 4. ML 能力启用（v0.2，可选）
+
+语义检索（本地 Chinese-CLIP）与轻量文本风险模型（fasttext.pt）依赖 ML 运行库，按需启用：
+
+```bash
+# ① 安装 ML 依赖（torch / transformers，体积大；首次约数 GB）
+uv sync --extra ml
+
+# ② 构建向量库：import_manifest.jsonl → Chinese-CLIP 批量编码 → data/vectors/
+.venv\Scripts\python.exe scripts\build_vector_db.py                 # 全量（13.6 万条，GPU 优先）
+.venv\Scripts\python.exe scripts\build_vector_db.py --dry-run       # 只统计不编码
+.venv\Scripts\python.exe scripts\build_vector_db.py --max-rows 5    # 调试小样本
+```
+
+- **权重**：首次运行自动从 HuggingFace 下载 `OFA-Sys/chinese-clip-vit-base-patch16`（约数百 MB）；
+  离线 / 内网环境用 `--model <本地权重目录>` 指向已下载权重；更多参数见脚本 `--help`。
+- **断点续跑**：已编码 id 记录在 `data/vectors/done_ids.json`，中途中断后重跑自动跳过已入库条目；
+  **全量重建** = 清空 `data/vectors/` 后重跑。
+
+```bash
+# ③ 配置（config.yaml，样例见 config.example.yaml 对应注释块）
+#    embedding.local.*   → Chinese-CLIP 后端（model_name / weights_path / device）
+#    light_model.*       → fasttext.pt + config.json
+#      （复用 开发/cherry文本分类/部署/model/ 训练产物，或拷入 data/models/ 后指向该路径）
+
+# ④ 重启服务：向量库与模型随启动加载；/health 出现 embedding / light_model / semantic
+#    降级项时，按上面步骤检查 ML 依赖与配置。
+```
+
+### 5. 运行服务（v0.1 待 T10/T11 集成）
 
 T10/T11 落地后，双服务分别启动：
 
@@ -74,7 +103,7 @@ T10/T11 落地后，双服务分别启动：
 .venv\Scripts\python.exe -m uvicorn safefusion.api.admin:create_admin_app --host 0.0.0.0 --port 8001
 ```
 
-### 5. Docker
+### 6. Docker
 
 ```bash
 docker compose up -d --build
@@ -111,7 +140,7 @@ src/safefusion/
 ├── storage/        # SQLite DAO + 自研 numpy 向量库
 ├── config.py       # 配置三层加载（默认值 → YAML → 环境变量）
 └── logging_setup.py
-scripts/            # normalize_assets.py 资产归一化
+scripts/            # normalize_assets.py 资产归一化；build_vector_db.py 向量库构建（ML，v0.2）
 tests/              # pytest 用例
 data/               # 运行时数据（gitignored，不入库）
 docs/               # 用户文档（如有）

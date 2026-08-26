@@ -72,6 +72,12 @@ cache:
 light_model:
   model_path: null            # fasttext.pt 路径；null = 未启用（组件 disabled，不抛异常）
   config_path: null           # 模型配套 config.json 路径；null = 未启用
+  # 启用示例（复用 cherry 文本分类训练产物，路径按实际部署位置调整）：
+  #   model_path: "data/models/fasttext.pt"
+  #   config_path: "data/models/config.json"
+  # 说明：ML 环境就绪后（uv sync --extra ml），把
+  #   开发/cherry文本分类/部署/model/{fasttext.pt,config.json} 拷入 data/models/（推荐，data/ 已 gitignore），
+  #   或直接指向原路径；重启服务后轻量层随语义检索一并启用。
 
 # ---- 日志 ----
 logging:

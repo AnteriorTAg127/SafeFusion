@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import pytest
 
+from safefusion.cache.backends import CacheBackendError, MemoryBackend, RedisBackend
 from safefusion.cache.caches import CacheLayer, _hamming_distance
 from safefusion.models.schemas import Overrides
 
@@ -231,3 +233,247 @@ class TestStatsAndHelpers:
         assert cache.stats()["high_freq"]["enabled"] is True
         cache2 = CacheLayer({"high_freq_cache": {"enabled": True, "capacity": 5, "ttl": 10}})
         assert cache2.stats()["high_freq"]["enabled"] is True
+
+
+class _FakeRedis:
+    """内存假 Redis：满足 RedisBackend 使用的异步 get/set/expire/delete/keys/ping 语义。
+
+    - ``expire`` 记录截止时刻，``get`` 命中过期键返回 None 并清除（模拟 Redis TTL）；
+    - ``broken`` 置 True 后所有调用抛 ConnectionError（模拟运行期断连，测降级路径）。
+    """
+
+    def __init__(self, broken: bool = False) -> None:
+        self._store: dict[str, str] = {}
+        self._expiry: dict[str, float] = {}
+        self.broken = broken
+
+    def _check(self) -> None:
+        if self.broken:
+            raise ConnectionError("模拟 Redis 连接中断")
+
+    async def ping(self) -> bool:
+        self._check()
+        return True
+
+    async def get(self, key: str) -> str | None:
+        self._check()
+        deadline = self._expiry.get(key)
+        if deadline is not None and time.monotonic() > deadline:
+            self._store.pop(key, None)
+            self._expiry.pop(key, None)
+            return None
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str, *args: Any, **kwargs: Any) -> None:
+        self._check()
+        self._store[key] = value
+        self._expiry.pop(key, None)
+
+    async def expire(self, key: str, seconds: int) -> None:
+        self._check()
+        self._expiry[key] = time.monotonic() + seconds
+
+    async def delete(self, *keys: str) -> int:
+        self._check()
+        removed = 0
+        for key in keys:
+            if key in self._store:
+                self._store.pop(key, None)
+                self._expiry.pop(key, None)
+                removed += 1
+        return removed
+
+    async def keys(self, pattern: str = "*") -> list[str]:
+        import fnmatch
+
+        self._check()
+        return [key for key in list(self._store) if fnmatch.fnmatch(key, pattern)]
+
+
+class TestMemoryBackend:
+    """MemoryBackend：LRU 驱逐 / TTL / 删除清理 / 未过期快照。"""
+
+    def test_lru_eviction(self) -> None:
+        backend = MemoryBackend(capacity=2)
+        backend.set("a", "1", 0)
+        backend.set("b", "2", 0)
+        backend.get("a")  # 刷新 a 的 LRU 位置
+        backend.set("c", "3", 0)
+        assert backend.get("a") == "1"
+        assert backend.get("b") is None  # b 被驱逐
+        assert backend.size() == 2
+
+    def test_ttl_expiry(self) -> None:
+        backend = MemoryBackend()
+        backend.set("k", "v", 0.05)
+        assert backend.get("k") == "v"
+        time.sleep(0.07)
+        assert backend.get("k") is None
+        assert backend.size() == 0
+
+    def test_ttl_zero_never_expires(self) -> None:
+        backend = MemoryBackend()
+        backend.set("k", "v", 0)
+        assert backend.get("k") == "v"
+
+    def test_items_excludes_expired(self) -> None:
+        backend = MemoryBackend()
+        backend.set("a", "1", 0.05)
+        backend.set("b", "2", 0)
+        time.sleep(0.07)
+        assert backend.items() == [("b", "2")]
+
+    def test_delete_and_clear(self) -> None:
+        backend = MemoryBackend()
+        backend.set("a", "1", 0)
+        backend.set("b", "2", 0)
+        backend.delete("a")
+        assert backend.get("a") is None
+        backend.clear()
+        assert backend.size() == 0
+
+
+class TestRedisBackend:
+    """RedisBackend（注入内存假 Redis）：前缀 / TTL 走 expire / 清理 / 失败抛错。"""
+
+    def _backend(self, **kwargs: Any) -> tuple[RedisBackend, _FakeRedis]:
+        fake = kwargs.pop("fake", _FakeRedis())
+        backend = RedisBackend(url="redis://127.0.0.1:6379/0", prefix="sf:", client=fake)
+        return backend, fake
+
+    def test_prefix_applied(self) -> None:
+        backend, fake = self._backend()
+        backend.set("k", "v", 0)
+        assert fake._store == {"sf:k": "v"}
+        assert backend.get("k") == "v"
+        assert backend.get("missing") is None
+
+    def test_ttl_via_expire(self) -> None:
+        backend, fake = self._backend()
+        backend.set("k", "v", 30)
+        assert "sf:k" in fake._expiry  # TTL 已经 Redis expire 下发
+        backend.set("forever", "v", 0)
+        assert "sf:forever" not in fake._expiry  # ttl<=0 永不过期
+        assert backend.get("k") == "v"
+
+    def test_ttl_expiry_effect(self) -> None:
+        backend, _ = self._backend()
+        backend.set("k", "v", 0.05)
+        assert backend.get("k") == "v"
+        time.sleep(0.07)
+        assert backend.get("k") is None
+
+    def test_delete(self) -> None:
+        backend, _ = self._backend()
+        backend.set("k", "v", 0)
+        backend.delete("k")
+        assert backend.get("k") is None
+
+    def test_clear_only_own_prefix(self) -> None:
+        backend, fake = self._backend()
+        backend.set("a", "1", 0)
+        fake._store["other:x"] = "keep"  # 其它前缀键不受 clear 影响
+        backend.clear()
+        assert backend.get("a") is None
+        assert fake._store == {"other:x": "keep"}
+
+    def test_items_strips_prefix(self) -> None:
+        backend, _ = self._backend()
+        backend.set("k1", "v1", 0)
+        backend.set("k2", "v2", 0)
+        assert backend.items() == [("k1", "v1"), ("k2", "v2")]
+
+    def test_size_is_none(self) -> None:
+        backend, _ = self._backend()
+        assert backend.size() is None
+
+    def test_init_ping_failure_raises(self) -> None:
+        with pytest.raises(CacheBackendError):
+            RedisBackend(prefix="sf:", client=_FakeRedis(broken=True))
+
+    def test_init_unreachable_url_raises(self) -> None:
+        # 天然确定性：本环境 redis 模块缺失直接抛；即便已安装，127.0.0.1:1 也必然拒连
+        with pytest.raises(CacheBackendError):
+            RedisBackend(url="redis://127.0.0.1:1/0")
+
+
+class TestRedisCacheLayer:
+    """CacheLayer + RedisBackend：五级行为与 memory 等价（除 TTL 由 Redis 侧控制）。"""
+
+    def _layer(self, cfg: dict | None = None) -> tuple[CacheLayer, _FakeRedis]:
+        fake = _FakeRedis()
+        backend = RedisBackend(prefix="sf:", client=fake)
+        return CacheLayer(cfg or {}, backend=backend), fake
+
+    def test_five_levels_equivalent_to_memory(self) -> None:
+        cache, _ = self._layer()
+        cache.put_audit_result("k1", {"v": 1})
+        assert cache.get_audit_result("k1") == {"v": 1}
+        cache.put_high_freq("h", {"r": 1})
+        assert cache.get_high_freq("h") == {"r": 1}
+        cache.put_short_text_llm("s", {"is_violation": True})
+        assert cache.get_short_text_llm("s") == {"is_violation": True}
+        cache.put_dedup("md5-1", "0" * 63 + "0", {"r": "base"})
+        assert cache.get_dedup(md5="md5-1") == {"r": "base"}
+        assert cache.get_dedup(phash="0" * 63 + "1", max_distance=1) == {"r": "base"}
+        cache.load_permanent(["pb"], ["pw"])
+        assert cache.check_permanent("pb") == "black"
+        assert cache.check_permanent("pw") == "white"
+        assert cache.stats()["permanent_lists"] == {"enabled": True, "black": 1, "white": 1}
+
+    def test_redis_keys_prefixed(self) -> None:
+        cache, fake = self._layer()
+        cache.put_audit_result("k", {"v": 1})
+        assert set(fake._store) == {"sf:k"}
+        assert all(key.startswith("sf:") for key in fake._store)
+
+    def test_ttl_controlled_by_redis_side(self) -> None:
+        cache, _ = self._layer({"audit_cache": {"ttl": 0.05, "enabled": True}})
+        cache.put_audit_result("k", {"v": 1})
+        assert cache.get_audit_result("k") == {"v": 1}
+        time.sleep(0.07)
+        assert cache.get_audit_result("k") is None  # 过期由 Redis 侧 expire 生效
+
+    def test_stats_meta_on_redis(self) -> None:
+        cache, _ = self._layer()
+        stats = cache.stats()
+        assert stats["_meta"]["backend"] == "redis"
+        assert stats["_meta"]["degraded_backend"] is None
+        assert stats["audit_cache"]["size"] is None  # Redis 侧不精确统计
+
+    def test_runtime_break_falls_back_to_memory(self) -> None:
+        cache, fake = self._layer()
+        cache.put_high_freq("h2", {"r": 2})
+        assert cache.degraded_backend is None
+        fake.broken = True
+        cache.put_high_freq("h3", {"r": 3})  # 首次失败 → 降级 memory 并重试写成功
+        assert cache.degraded_backend == "redis"
+        assert cache.get_high_freq("h3") == {"r": 3}  # 降级当次写入不丢
+        assert cache.get_high_freq("h2") is None  # 降级前缓存在 Redis，切 memory 后不可见
+
+
+class TestRedisDegradation:
+    """Redis 不可达 → 自动降级 memory + warning + degraded_backend 标记。"""
+
+    def _assert_degraded(self, cache: CacheLayer) -> None:
+        assert cache.degraded_backend == "redis"
+        cache.put_audit_result("k", {"v": 1})
+        assert cache.get_audit_result("k") == {"v": 1}
+        meta = cache.stats()["_meta"]
+        assert meta["backend"] == "memory"
+        assert meta["degraded_backend"] == "redis"
+
+    def test_unreachable_url_degrades(self) -> None:
+        # 端口 1：redis 模块缺失直接抛；即便已安装也必然拒连 → 降级路径天然确定
+        cache = CacheLayer({"backend": "redis", "redis": {"url": "redis://127.0.0.1:1/0"}})
+        self._assert_degraded(cache)
+
+    def test_constructor_failure_degrades(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import safefusion.cache.caches as caches_mod
+
+        def _boom(*args: Any, **kwargs: Any) -> None:
+            raise CacheBackendError("模拟 Redis 不可达")
+
+        monkeypatch.setattr(caches_mod, "RedisBackend", _boom)
+        cache = CacheLayer({"backend": "redis"})
+        self._assert_degraded(cache)

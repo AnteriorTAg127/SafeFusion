@@ -122,6 +122,8 @@ class FakeLLM:
         exc: 若非 None，judge 每次调用抛该异常（调用异常路径）。
         available: 模拟 LLMClient.available（False 时编排层直接跳过）。
         judge_calls: judge 调用计数。
+        last_animated / last_images / last_text: 最近一次 judge 的动图标记与
+            入参（供编排层多帧断言，v0.2 M3）。
     """
 
     def __init__(
@@ -134,6 +136,9 @@ class FakeLLM:
         self.exc = exc
         self.available = available
         self.judge_calls = 0
+        self.last_animated: bool = False
+        self.last_images: list[Any] = []
+        self.last_text: str | None = None
 
     async def judge(
         self,
@@ -142,8 +147,12 @@ class FakeLLM:
         context: str | None,
         *,
         cache_hint: str | None = None,
+        animated: bool = False,
     ) -> dict[str, Any] | None:
         self.judge_calls += 1
+        self.last_text = text
+        self.last_images = list(images)
+        self.last_animated = animated
         if self.exc is not None:
             raise self.exc
         return self.verdict

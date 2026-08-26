@@ -77,12 +77,28 @@ class TestPinyinVariants:
         hits = eng.scan("jiewen 一下")
         assert not has_hit(hits, "捡闻", 0, 7)
 
-    def test_pinyin_initials(self) -> None:
+    def test_pinyin_initials_three_char_word(self) -> None:
+        # 拼音首字母变体仅对 ≥3 汉字的词生成（2 字词不再生成，见
+        # test_two_char_no_pinyin_init_false_hit）
         eng = KeywordEngine()
-        eng.load_categories({"敏感": ["境外"]})
-        hits = eng.scan("有jw风险提示")
-        assert has_hit(hits, "境外", 1, 3)
-        assert any(h.matched == "jw" for h in hits)
+        eng.load_categories({"敏感": ["赌博网"]})
+        hits = eng.scan("有dbw推广")
+        assert has_hit(hits, "赌博网", 1, 4)
+        assert any(h.matched == "dbw" for h in hits)
+
+    def test_two_char_no_pinyin_init_false_hit(self) -> None:
+        # 回归（PRD v0.2 M1）：2 字词「安南」「虐童」不再生成首字母变体
+        # an/nt；否则「今天天气真不错」拼音串 jintiantian… 含 "an"、
+        # 「天天向上」拼音串 tiantian… 含 "nt"，会被误命中并错位回映射
+        eng = KeywordEngine()
+        eng.load_categories({"违规": ["安南", "虐童", "今天", "天天"]})
+        hits = eng.scan("今天天气真不错 天天向上")
+        # 正常命中不受影响
+        assert has_hit(hits, "今天", 0, 2)
+        assert has_hit(hits, "天天", 1, 3)
+        assert has_hit(hits, "天天", 8, 10)
+        # 不再出现 2 字词首字母误报
+        assert not any(h.keyword in ("安南", "虐童") for h in hits)
 
     def test_same_sound_back_mapping(self) -> None:
         eng = KeywordEngine()
@@ -164,10 +180,17 @@ class TestGenerateVariants:
     def test_contains_expected_kinds(self) -> None:
         variants = generate_variants("赌博")
         assert "dubo" in variants
-        assert "db" in variants
+        assert "db" not in variants  # 2 字词不再生成拼音首字母变体（PRD v0.2 M1）
         assert "賭博" in variants  # 繁简转换
         assert "赌@博" in variants  # 符号分隔（基于原文）
         assert "＋Ｑ" in generate_variants("+q")
+
+    def test_pinyin_init_boundary(self) -> None:
+        # 首字母变体仅对 ≥3 汉字的词生成；1~2 汉字词不生成
+        assert "dbw" in generate_variants("赌博网")
+        assert "an" not in generate_variants("安南")
+        assert "nt" not in generate_variants("虐童")
+        assert "j" not in generate_variants("接")
 
 
 class TestRegexRuleEngine:
@@ -257,3 +280,113 @@ class TestRegexRuleEngine:
         assert len(kept) == 1
         assert kept[0].category == "广告"
         assert kept[0].matched == "加我"
+
+    def test_load_from_rows_exempt(self) -> None:
+        # 数据库 rules 表行（含 id/is_active/created_at 等元数据）→ exempt 生效
+        rr = RegexRuleEngine()
+        rr.load_from_rows(
+            [
+                {
+                    "id": 1,
+                    "category": "广告",
+                    "pattern": "加我好友",
+                    "action": "exempt",
+                    "note": "广告豁免",
+                    "is_active": 1,
+                    "created_at": "2026-01-01T00:00:00.000+00:00",
+                }
+            ]
+        )
+        kept, exempted = rr.disambiguate("欢迎加我好友交流", [self._hit()])
+        assert kept == []
+        assert len(exempted) == 1
+        assert exempted[0]["rule"]["action"] == "exempt"
+
+    def test_load_from_rows_empty_category_applies_all(self) -> None:
+        rr = RegexRuleEngine()
+        rr.load_from_rows([{"category": "", "pattern": "加我好友", "action": "exempt"}])
+        kept, _ = rr.disambiguate("欢迎加我好友交流", [self._hit()])
+        assert kept == []
+
+    def test_load_from_rows_invalid_action_raises(self) -> None:
+        with pytest.raises(ValueError, match="action"):
+            RegexRuleEngine().load_from_rows(
+                [{"category": "广告", "pattern": "x", "action": "ban"}]
+            )
+
+
+class TestKeywordEngineReload:
+    """KeywordEngine.reload（PRD v0.2 M4）：原子替换 / 规则开关 / 失败回退。"""
+
+    def _hit(self, keyword: str = "加我", category: str = "广告", start: int = 0) -> KeywordHitData:
+        return KeywordHitData(keyword, category, keyword, start, start + len(keyword))
+
+    def test_reload_new_words_old_gone(self) -> None:
+        eng = KeywordEngine()
+        eng.load_categories({"广告": ["加我"]})
+        assert len(eng.scan("加我")) == 1
+        eng.reload({"色情": ["裸聊"]})
+        # 新词库生效、旧词库消失
+        assert eng.scan("加我") == []
+        assert has_hit(eng.scan("裸聊"), "裸聊", 0, 2)
+
+    def test_reload_with_rules_exempt(self) -> None:
+        eng = KeywordEngine()
+        eng.reload(
+            {"广告": ["加我"]},
+            [{"category": "广告", "pattern": "加我好友", "action": "exempt"}],
+        )
+        assert eng.rules_enabled is True
+        kept, exempted = eng.disambiguate("加我好友", [self._hit()])
+        assert kept == []
+        assert len(exempted) == 1
+
+    def test_reload_rules_none_disables_layer(self) -> None:
+        eng = KeywordEngine()
+        eng.reload({"广告": ["加我"]})  # 不传规则 → 规则层关闭（v0.1 行为）
+        assert eng.rules_enabled is False
+        kept, exempted = eng.disambiguate("加我好友", [self._hit()])
+        assert len(kept) == 1
+        assert exempted == []
+
+    def test_default_rules_disabled(self) -> None:
+        eng = KeywordEngine()
+        eng.load_categories({"广告": ["加我"]})
+        assert eng.rules_enabled is False
+        kept, exempted = eng.disambiguate("加我好友", [self._hit()])
+        assert len(kept) == 1
+        assert exempted == []
+
+    def test_reload_from_db_rows(self) -> None:
+        # 直接以数据库行加载（load_from_rows 语义进入 reload 链路）
+        eng = KeywordEngine()
+        eng.reload(
+            {"广告": ["加我"]},
+            [{"id": 1, "category": "广告", "pattern": "加我好友", "action": "exempt"}],
+        )
+        assert eng.rules_enabled is True
+        kept, exempted = eng.disambiguate("加我好友", [self._hit()])
+        assert kept == []
+
+    def test_reload_failure_keeps_old_instance(self) -> None:
+        eng = KeywordEngine()
+        eng.reload(
+            {"广告": ["加我"]},
+            [{"category": "广告", "pattern": "加我好友", "action": "exempt"}],
+        )
+        with pytest.raises(ValueError, match="action"):
+            eng.reload({"色情": ["裸聊"]}, [{"category": "色情", "pattern": "x", "action": "ban"}])
+        # 回退旧实例语义：词库与规则均保持旧状态
+        assert len(eng.scan("加我")) == 1
+        assert eng.scan("裸聊") == []
+        assert eng.rules_enabled is True
+        kept, exempted = eng.disambiguate("加我好友", [self._hit()])
+        assert kept == []
+        assert len(exempted) == 1
+
+    def test_reload_empty_categories(self) -> None:
+        eng = KeywordEngine()
+        eng.reload({})
+        assert eng.loaded is True
+        assert eng.scan("任何文本") == []
+        assert eng.rules_enabled is False
