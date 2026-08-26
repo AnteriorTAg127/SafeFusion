@@ -180,6 +180,34 @@ class Database:
             self._conn.commit()
             return cursor.rowcount > 0
 
+    def delete_key(self, key: str) -> bool:
+        """删除指定 API Key（主模型集成补齐，2026-08-26，供 DELETE /admin/keys/{key}）。
+
+        Returns:
+            True 表示确有该 Key 且已删除；False 表示 Key 不存在。
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM api_keys WHERE key = ?", (key,)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def update_key_note(self, key: str, note: str) -> bool:
+        """更新指定 Key 的备注（主模型集成补齐，2026-08-26，供 PATCH /admin/keys/{key}）。
+
+        Returns:
+            True 表示确有该 Key 且备注已更新；False 表示 Key 不存在。
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE api_keys SET note = ? WHERE key = ?", (note, key)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
     def get_key(self, key: str) -> dict[str, Any] | None:
         """按 Key 明文查询（含 enabled / tier，供鉴权使用）。
 

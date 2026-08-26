@@ -1,0 +1,25 @@
+# ===== 本地数据 / 开发过程文档（不入镜像）=====
+开发/
+data/
+models/
+logs/
+
+# ===== Python / 虚拟环境 / 构建缓存 =====
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# ===== VCS / 密钥 / IDE =====
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/

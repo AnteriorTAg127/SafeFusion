@@ -1,0 +1,30 @@
+# ============================================================
+# SafeFusion 编排（v0.1）
+# 用法: docker compose up -d --build
+# 说明:
+#   - 密钥经 docker compose 自动读取的同目录 .env 注入（不硬编码、不进 git）；
+#     常用: SAFEFUSION_LLM_API_KEY / SAFEFUSION_EMBEDDING_API_KEY /
+#           OPENAI_API_KEY / ADMIN_PASSWORD
+#   - ./data 挂载为容器内 /app/data：审计库 / 词库 / 向量库 / 白名单持久化
+#   - 审核 API :8000、管理 API :8001
+#   - 本地 CLIP 需要 torch：镜像默认未装 ML 依赖，请按 Dockerfile 注释扩展
+# ============================================================
+services:
+  safefusion:
+    build: .
+    image: safefusion:0.1.0
+    container_name: safefusion
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # 审核 API
+      - "8001:8001"   # 管理 API
+    volumes:
+      - ./data:/app/data
+    environment:
+      # 数据目录指向卷挂载点（config.example.yaml 默认 ./data）
+      SAFEFUSION_DATA_DIR: /app/data
+      # 密钥类一律来自 .env（未设置时为空字符串，服务启动时按降级链处理）
+      SAFEFUSION_LLM_API_KEY: ${SAFEFUSION_LLM_API_KEY:-}
+      SAFEFUSION_EMBEDDING_API_KEY: ${SAFEFUSION_EMBEDDING_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
