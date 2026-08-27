@@ -25,14 +25,17 @@ async function handleLogin(): Promise<void> {
     return
   }
   loading.value = true
+  // 先注入令牌（请求拦截器从 store 取 X-Admin-Token），再调配置端点验证；
+  // 顺序颠倒会导致验证请求不带任何头而必然 401（v0.2.1 登录页缺陷修复）
+  auth.setToken(token)
   try {
-    // 用输入 token 请求配置端点完成验证；端点存在（T22）且鉴权通过即视为有效
     await apiGet<unknown>('/config')
-    auth.setToken(token)
     toast.success('登录成功')
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/overview'
     void router.replace(redirect)
   } catch (error) {
+    // 验证失败：回滚本地令牌，避免残留无效凭证
+    auth.clearToken()
     // 401：token 无效；其余：后端未就绪 / 网络问题
     if (isAxiosError(error) && error.response?.status === 401) {
       toast.error('Token 无效，请检查后重试')
