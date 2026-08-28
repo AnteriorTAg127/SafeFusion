@@ -57,7 +57,7 @@ withDefaults(
 }
 
 .stat-purple {
-  background: #f5e8ff;
+  background: var(--purple-light);
 }
 
 .stat-green {
@@ -65,7 +65,7 @@ withDefaults(
 }
 
 .stat-orange {
-  background: #fff7e8;
+  background: var(--orange-light);
 }
 
 .stat-body {

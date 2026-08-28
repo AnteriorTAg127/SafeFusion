@@ -7,6 +7,7 @@
 
 /* ---------- 主题变量（浅色系） ---------- */
 :root {
+  color-scheme: light; /* 原生控件（select 下拉/日历/滚动条）随主题渲染 */
   --bg: #f0f2f5;
   --surface: #ffffff;
   --surface-hover: #f8f9fa;
@@ -27,6 +28,45 @@
   --shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08);
   --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  /* ---- T35 语义令牌（浅色值 = 收敛前的字面量，供 scoped 样式 var() 使用） ---- */
+  --purple-light: #f5e8ff; /* StatCard stat-purple 图标底色 */
+  --orange-light: #fff7e8; /* StatCard stat-orange / tag-orange 底色 */
+  --orange: #b5711a; /* tag-orange 文字 */
+  --toast-bg: #1d2129; /* toast 底色（原 var(--text)，暗色下需独立） */
+  --toast-text: #ffffff; /* toast 文字 */
+  --code-bg: rgba(255, 255, 255, 0.7); /* 代码块/芯片底色（设置页 code、指南 curl 块） */
+  --primary-glow: rgba(22, 93, 255, 0.1); /* 输入框聚焦光圈 */
+}
+
+/* ---------- 主题变量（深色系，data-theme="dark" 时整体覆盖） ---------- */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #10151b;
+  --surface: #1a2129;
+  --surface-hover: #222b35;
+  --text: #e6e9ed;
+  --text-2: #aeb6c2;
+  --text-3: #6e7a8a;
+  --border: #2c3542;
+  /* 主色提亮一档以适配深色底（蓝底上的 #fff 按钮文字对比度不变） */
+  --primary: #3e7bff;
+  --primary-light: #1c2b4a;
+  --primary-hover: #5d90ff;
+  --success: #34c95e;
+  --success-light: #173322;
+  --danger: #ff5f5f;
+  --danger-light: #3a2023;
+  --danger-hover: #ff7d78;
+  /* 阴影加深以在深色底保持层次 */
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.55);
+  --purple-light: #2a2140;
+  --orange-light: #35291a;
+  --orange: #e3a04b;
+  --toast-bg: #3d4754;
+  --toast-text: #f2f4f7;
+  --code-bg: rgba(255, 255, 255, 0.08);
+  --primary-glow: rgba(77, 130, 255, 0.28);
 }
 
 /* ---------- 基础 ---------- */
@@ -49,6 +89,10 @@ body {
   color: var(--text);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  /* T35：主题切换时背景/文字平滑过渡（首次渲染无属性变化，不会触发闪烁动画） */
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease;
 }
 
 @keyframes fadeIn {
@@ -180,7 +224,7 @@ body {
 
 .input:focus {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(22, 93, 255, 0.1);
+  box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
 .input-sm {
@@ -276,8 +320,8 @@ body {
 .toast {
   padding: 12px 24px;
   border-radius: var(--radius-sm);
-  background: var(--text);
-  color: #fff;
+  background: var(--toast-bg);
+  color: var(--toast-text);
   font-size: 0.84rem;
   font-weight: 500;
   box-shadow: var(--shadow-lg);
@@ -294,7 +338,7 @@ body {
 }
 
 .toast-info {
-  background: var(--text);
+  background: var(--toast-bg);
 }
 
 @keyframes toastIn {
@@ -306,4 +350,26 @@ body {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* ---------- 深色覆盖（scoped 样式字面量的暗色适配，T35 报告收敛清单） ----------
+ * 收敛策略：能直接改的（style.css 自身 / StatCard.vue 等无并行编辑的文件）一律
+ * 改为 var()；以下两处字面量位于 T36 并行编辑的视图（ReviewView/SettingsView），
+ * 为避免同一文件并发冲突，以全局高优先级规则在暗色下覆盖——数值收敛于暗色
+ * 令牌（--orange-light/--orange/--code-bg），亮色仍走视图内原有字面量（与令牌
+ * 浅色值一致）。:root 前缀保证特异性 (0,3,0) 高于 scoped 选择器 (0,2,0)，
+ * 与样式注入顺序无关。 */
+:root[data-theme='dark'] .tag-orange {
+  background: var(--orange-light);
+  color: var(--orange);
+}
+
+:root[data-theme='dark'] .restart-desc code {
+  background: var(--code-bg);
+}
+
+/* GuideMenu（T36 新增）代码块底色为浅色字面量 #f6f8fa，暗色下文本不可读 →
+ * 以全局规则覆盖为暗色代码块底色（不改动 T36 文件，避免并行写入冲突） */
+:root[data-theme='dark'] .guide-code {
+  background: var(--code-bg);
 }

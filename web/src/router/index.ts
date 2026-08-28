@@ -5,7 +5,8 @@ import { useAuthStore } from '../stores/auth'
  * 路由表：
  * - /login           登录页（公开，无需 token）
  * - /                布局容器（AppLayout：顶栏 + 分区切换 + 子路由出口）
- *   - /overview /audit /keywords /whitelist /rules /review /settings  7 个子路由
+ *   - /trial /overview /audit /keywords /whitelist /rules /review /settings /keys  9 个子路由
+ *   （keys 密钥管理归「系统设置」分区，trial 试运行独立分区，见 ScopeSwitch）
  * - 全局前置守卫：无 token 且目标非 /login → 重定向 /login（PRD 决策 G）
  */
 const router = createRouter({
@@ -22,6 +23,12 @@ const router = createRouter({
       component: () => import('../components/AppLayout.vue'),
       children: [
         { path: '', redirect: { name: 'overview' } },
+        {
+          path: 'trial',
+          name: 'trial',
+          component: () => import('../views/TrialView.vue'),
+          meta: { title: '试运行' },
+        },
         {
           path: 'overview',
           name: 'overview',
@@ -63,6 +70,12 @@ const router = createRouter({
           name: 'settings',
           component: () => import('../views/SettingsView.vue'),
           meta: { title: '系统设置' },
+        },
+        {
+          path: 'keys',
+          name: 'keys',
+          component: () => import('../views/KeysView.vue'),
+          meta: { title: '密钥管理' },
         },
       ],
     },

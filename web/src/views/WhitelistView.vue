@@ -22,6 +22,7 @@
  */
 import { onMounted, ref } from 'vue'
 import DataTable from '../components/DataTable.vue'
+import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { apiGet, apiPost, apiDelete } from '../api/client'
@@ -52,6 +53,12 @@ const loading = ref(false)
 const uploading = ref(false)
 const deleting = ref<WhitelistRow | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
+/** 添加上传面板引用：空态「去上传图片」滚动到此处（PRD §M1） */
+const addPanelRef = ref<HTMLElement | null>(null)
+
+function scrollToAddPanel(): void {
+  addPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 function textOf(value: unknown): string {
   return value === null || value === undefined ? '' : String(value)
@@ -155,9 +162,13 @@ const columns = [
 <template>
   <section class="page-view">
     <h2 class="page-title">🖼️ 图片白名单</h2>
+    <p class="page-hint">
+      登记确定安全、应在审核中快速放行的图片（如品牌 Logo、官方配图）：上传后按 md5 + pHash 入库，
+      审核时命中白名单的图片将走快速放行通道。主操作 = 上方「📤 上传并入库」。
+    </p>
 
     <!-- 添加区 -->
-    <div class="card">
+    <div ref="addPanelRef" class="card">
       <div class="card-title"><span>➕ 添加白名单图片</span></div>
       <div class="add-row">
         <input ref="fileInput" type="file" class="input add-file" accept="image/*" multiple />
@@ -175,7 +186,16 @@ const columns = [
     <!-- 列表 -->
     <div class="card">
       <div class="card-title"><span>🗂️ 白名单列表（共 {{ total }} 条）</span></div>
-      <DataTable :columns="columns" :rows="rows" :loading="loading" empty-text="暂无白名单图片">
+      <DataTable :columns="columns" :rows="rows" :loading="loading">
+        <template #empty>
+          <EmptyState
+            icon="🖼️"
+            title="暂无白名单图片"
+            :hint="'白名单用于在审核时快速放行确定安全的图片（如品牌 Logo、官方配图）。\n在上方选择一张或多张图片上传：后端逐个计算 md5 + pHash 入库，之后相同或近似图片（汉明距离在阈值内）在审核中会命中白名单快速放行。'"
+            action-text="去上传图片"
+            @action="scrollToAddPanel"
+          />
+        </template>
         <template #cell="{ row, column }">
           <template v-if="column.key === 'image'">
             <div class="img-cell">
@@ -212,6 +232,14 @@ const columns = [
 </template>
 
 <style scoped>
+/* 标题下操作提示行（PRD v0.3.0 §M1：每页用途 + 主操作） */
+.page-hint {
+  font-size: 0.76rem;
+  color: var(--text-3);
+  line-height: 1.7;
+  margin: -8px 0 14px;
+}
+
 .add-row {
   display: flex;
   flex-wrap: wrap;

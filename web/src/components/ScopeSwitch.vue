@@ -4,10 +4,11 @@ import { useRoute, useRouter } from 'vue-router'
 
 /**
  * 顶层功能分区滑动高光分段控件（对齐参考项目 scope-switch）：
- * 3 个分区覆盖全部 7 个子路由：
+ * 4 个分区覆盖全部 9 个子路由：
+ * - 试运行：/trial（现场验证全链路，M2 上手主入口）
  * - 审核管理：/overview /audit /review
  * - 词库与规则：/keywords /whitelist /rules
- * - 系统设置：/settings
+ * - 系统设置：/settings /keys（密钥管理 v0.3.0 §M7）
  * 点击分区跳转到该分区的第一个路由；高色光块随激活分区平滑滑动。
  */
 interface Partition {
@@ -18,9 +19,10 @@ interface Partition {
 }
 
 const partitions: Partition[] = [
+  { key: 'trial', icon: '🧪', label: '试运行', routes: ['trial'] },
   { key: 'audit', icon: '🔍', label: '审核管理', routes: ['overview', 'audit', 'review'] },
   { key: 'lexicon', icon: '📚', label: '词库与规则', routes: ['keywords', 'whitelist', 'rules'] },
-  { key: 'system', icon: '⚙️', label: '系统设置', routes: ['settings'] },
+  { key: 'system', icon: '⚙️', label: '系统设置', routes: ['settings', 'keys'] },
 ]
 
 const route = useRoute()

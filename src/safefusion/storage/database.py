@@ -80,6 +80,21 @@ _CREATE_TABLES: tuple[str, ...] = (
         UNIQUE (category, pattern, action)
     )
     """,
+    # PRD v0.3.0 M4：配置 settings 表（取代 data/config_overrides.json）。
+    # group 为配置分组名（对齐 AppConfig 分组白名单），key 为该分组内
+    # **叶子字段的点分路径**（如 embedding 组的 "local.model_name"——
+    # 与 config_override._leaf_paths 口径一致，便于逐叶子来源标识与
+    # 环境变量「钉住」对比），value_json 为 JSON 序列化后的叶子值；
+    # "group" 是 SQLite 保留字，全部 SQL 中一律加引号引用。
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        "group"    TEXT NOT NULL,
+        key        TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY ("group", key)
+    )
+    """,
 )
 
 #: 辅助索引：白名单 md5 唯一（防重复图入库）、审核日志按时间/来源查询提速、
@@ -284,6 +299,53 @@ class Database:
             self._conn.commit()
             return cursor.rowcount > 0
 
+    def dedup_keywords(self) -> dict[str, int]:
+        """按 (category, 归一化词) 一键去重：清理全半角/空白/标点等变体重复。
+
+        ``keywords`` 表有 UNIQUE(category, word) 约束，精确重复不存在；去重
+        针对历史脏数据/变体词条（如「敏感词」与「敏感词！」）：归一化键 =
+        全角转半角 + 去空白 + 剥离常见标点，同类别同键保留最小 id（v0.3.0 G10）。
+
+        Returns:
+            ``{"before", "after", "removed"}`` 计数（after = before - removed）。
+        """
+
+        def _norm(word: str) -> str:
+            out: list[str] = []
+            for ch in word:
+                code = ord(ch)
+                if code == 0x3000:
+                    code = 0x20
+                elif 0xFF01 <= code <= 0xFF5E:  # 全角 → 半角
+                    code -= 0xFEE0
+                ch = chr(code)
+                if ch.isspace() or ch in "，。！？：；、（）()【】[]《》〈〉“”\"''.,!?:;":
+                    continue
+                out.append(ch)
+            return "".join(out)
+
+        rows = self.list_keywords()
+        removed_ids: list[int] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            key = (row["category"] or "", _norm(row["word"] or ""))
+            if key in seen:
+                removed_ids.append(int(row["id"]))
+            else:
+                seen.add(key)
+        before = len(rows)
+        if not removed_ids:
+            return {"before": before, "after": before, "removed": 0}
+        with self._lock:
+            placeholders = ",".join("?" * len(removed_ids))
+            cursor = self._conn.execute(
+                f"DELETE FROM keywords WHERE id IN ({placeholders})", removed_ids
+            )
+            self._conn.commit()
+            removed = cursor.rowcount
+            after = self._conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+            return {"before": before, "after": after, "removed": removed}
+
     # ------------------------------------------------------------------ rules
 
     def add_rules(
@@ -450,6 +512,91 @@ class Database:
 
         with self._lock:
             cursor = self._conn.execute("DELETE FROM whitelist_meta WHERE id = ?", (entry_id,))
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    # ---------------------------------------------------------------- settings
+
+    #: settings 页面按 (group, key) 排序的一致性（utf8_binary 序），保证
+    #: list_settings 输出稳定（供来源标识 / 合并使用）。
+    _SETTINGS_ORDER = ' ORDER BY "group", key'
+
+    def list_settings(self, group: str | None = None) -> list[dict[str, Any]]:
+        """列出 settings 行（PRD v0.3.0 M4）。
+
+        Args:
+            group: 分组名过滤；None 返回全部。返回行不含解析后的 value
+                （原始 value_json 字符串保留，由配置层统一解析）。
+
+        Returns:
+            行字典列表（"group" / key / value_json / updated_at，按 (group, key) 升序）。
+        """
+
+        sql = 'SELECT "group", key, value_json, updated_at FROM settings'
+        params: list[Any] = []
+        if group is not None:
+            sql += ' WHERE "group" = ?'
+            params.append(group)
+        sql += self._SETTINGS_ORDER
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            return [_row_to_dict(row) for row in rows]
+
+    def get_setting(self, group: str, key: str) -> dict[str, Any] | None:
+        """读取单个设置项。
+
+        Args:
+            group: 分组名。
+            key: 组内叶子点分路径（如 ``local.model_name``）。
+
+        Returns:
+            行字典（"group" / key / value_json / updated_at），不存在返回 None。
+        """
+
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT "group", key, value_json, updated_at FROM settings '
+                'WHERE "group" = ? AND key = ?',
+                (group, key),
+            ).fetchone()
+            return _row_to_dict(row) if row is not None else None
+
+    def set_settings(self, group: str, values: dict[str, Any]) -> None:
+        """整组 upsert 配置项（PRD v0.3.0 M4）。
+
+        Args:
+            group: 分组名。
+            values: ``{叶子点分路径: 值}`` 映射，值为任意 JSON 可序列化对象
+                （建议由配置层先把嵌套分组载荷展平为叶子路径后再写入，
+                与 :meth:`list_settings` 的 key 口径一致）。
+
+        Note:
+            逐键 ``INSERT … ON CONFLICT DO UPDATE``（值整体替换、更新
+            updated_at）；已在组内的其他键保持不变——调用方按「整组替换」
+            语义时需自行传入该组全部叶子（管理端 PUT 仅传负载字段，
+            保持 v0.2.1 覆盖层「部分键覆盖」语义）。
+        """
+
+        with self._lock:
+            for key, value in values.items():
+                self._conn.execute(
+                    'INSERT INTO settings ("group", key, value_json, updated_at) '
+                    "VALUES (?, ?, ?, ?) "
+                    'ON CONFLICT("group", key) DO UPDATE SET '
+                    "value_json = excluded.value_json, updated_at = excluded.updated_at",
+                    (group, str(key), json.dumps(value, ensure_ascii=False), _utc_now()),
+                )
+            self._conn.commit()
+
+    def delete_settings(self, group: str) -> bool:
+        """删除整个分组的设置项。
+
+        Returns:
+            True 表示确有该分组且已删除；False 表示分组不存在。
+        """
+
+        with self._lock:
+            cursor = self._conn.execute('DELETE FROM settings WHERE "group" = ?', (group,))
             self._conn.commit()
             return cursor.rowcount > 0
 

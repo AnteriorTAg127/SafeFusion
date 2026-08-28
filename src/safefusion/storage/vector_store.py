@@ -129,6 +129,11 @@ class BaseVectorStore(ABC):
     def count(self, pool: str) -> int:
         """返回指定池的向量条数（池未初始化时返回 0）。"""
 
+    def dim(self, pool: str) -> int | None:
+        """返回指定池的向量维度；未初始化 / 空池 / 后端不支持时返回 None。"""
+
+        return None
+
 
 class NumpyVectorStore(BaseVectorStore):
     """numpy 后端向量库（默认后端，PRD §3.3）。
@@ -292,3 +297,15 @@ class NumpyVectorStore(BaseVectorStore):
 
         data = self._state.get(pool)
         return int(data.vectors.shape[0]) if data is not None else 0
+
+    def dim(self, pool: str) -> int | None:
+        """返回指定池的向量维度（admin /health、/admin/models 展示用）。
+
+        Returns:
+            池的向量维度；池未初始化或为空返回 None。
+        """
+
+        data = self._state.get(pool)
+        if data is None or data.vectors.shape[0] == 0:
+            return None
+        return int(data.vectors.shape[1])

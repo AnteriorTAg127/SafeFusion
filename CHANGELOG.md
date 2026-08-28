@@ -2,6 +2,28 @@
 
 本文件记录 SafeFusion 面向用户的版本变更（[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本）。内部开发日志见 `开发/changelog.md`（不入库）；真实数据不在本仓库分发，见 README「数据资产」。
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- **配置存储升级（架构变更）**：SQLite `settings` 表取代 `config_overrides.json`（启动自动迁移）；优先级 内置默认 < config.yaml < 数据库 < 环境变量（**env 只覆盖内存、绝不写 DB**）；设置页每个字段带**生效来源徽标**（默认/YAML/数据库/环境变量，`GET /admin/config/sources`）
+- **全量热应用（保存即生效）**：参数类（阈值/开关/复核）直接生效；embedding/llm/light_model/cache 组件重建类**先试建造→落库→原子替换→失败回滚**（500 未落库）；server/logging 端口类下次启动生效（响应标注 `apply_scope`）；改密即时热切（旧令牌立即失效，持久化 DB）
+- **模型懒加载 + 按需下载**：启动**不再装配/下载模型**（零网络）；首次审核触发单飞装配（缓存命中秒级，失败细分原因码不自动重试）；`GET /admin/models` 状态 + `POST /admin/models/download` 后台任务（进度轮询）+ `/admin/models/load` 显式装配；设置页「🤖 模型卡」下载/装配/进度可视化 + 分步指引
+- **前端管理面板大改（易用性）**：深色主题（跟随系统 + 顶栏切换 + 防闪烁）、**🧪 试运行页**（随机示例一键填充 → 分层证据面板）、概览**系统状态区**（8 组件徽标 + 中文原因 + 跳转）与**数据状态卡**（词库/向量/白名单/规则计数）、审核记录**CSV 导出 + 自动刷新 + 证据面板详情**、词库**一键去重**（自动备份 zip + 结果摘要）、**API Key 管理页**（创建一次性显示完整 Key / 脱敏前缀列表 / 停用删除）、设置页**测试连接**（embedding/llm/fasttext 冒烟）、**首次使用三步向导**、空态即下一步、导入格式示例内嵌、顶栏指南
+- **guardian 正则规则库入库**：从 `guardian_benchmark/db/lexicon.db` 提取 **24,531 条**规则（骂人/脏话 24,014 + 广告推广 517，action=violate，0 非法 pattern）直接导入 SQLite
+- **RegexRuleEngine 命中词索引**：规则提取关键短语建 AC 倒排，查询按关键词命中词**只匹配相关子集**（正确性安全网：仅「命中必含某短语且短语未现」才跳过，未覆盖回退全量扫描，判定逐字等价）
+- **数据资产**：真实群聊记录清洗出**白语料 53,341 条**（`white_groupchat.csv`，与既有白池去重后合入，白池总计 92,476 条）；`normalize_assets.py` 新增 `--images-dir` 图片清单生成（黑白池自动归属/校验/去重）+ **图片语料准备指南**
+- **管理端点新增（11 个）**：`/admin/health`、`/admin/models`×4、`/admin/test-examples`、`/admin/test-audit`、`/admin/config/test-connection`、`/admin/config/password`、`/admin/config/sources`、`/admin/keywords/dedup`；`PATCH/DELETE /admin/keys/{key}` 支持**脱敏前缀唯一匹配**
+- **README 重写为上手手册**：快速开始/数据准备向导/模型部署实践/配置体系/界面导览/审核 API 对接/管理端点全表（32 个）/升级与备份/FAQ
+- **测试**：580 个 pytest 用例（577 基线零回归 + 新增 3）、ruff 全绿、前端构建 721 模块零类型错误、人工第四轮 14/14 PASS（热应用/懒加载/改密闭环/去重实跑）
+
+### Notes
+
+- `server`/`logging` 分组热应用为 `apply_scope="config"`（端口/日志绑定需重启）；`review.interval_min` 热入库但调度器间隔冻结于启动
+- 模型装配失败**不自动重试**，需在设置页「模型卡」或 `/admin/models/load` 显式重试；本地装配一律 `local_files_only` 只读缓存、绝不因装配联网下载（下载走 download 端点）
+- 审核日志仍不落原文全文（隐私权衡）；试运行走业务管线（会写审计日志）
+- 向量库构建（`build_vector_db.py`）与在线 embedding 联调仍按用户决策延后（v0.2.2 事项；本期完成数据侧全部准备：语料/图片清单/guardian 规则）
+
 ## [0.2.1] - 2026-08-27
 
 ### Added

@@ -8,9 +8,14 @@
     ├── keywords/<类别>.csv          # 词库：(word, category, source)
     ├── corpus/black.csv             # 违规语料：(text, label, category, source)
     ├── corpus/white.csv             # 安全语料：(text, label, category, source)
-    └── vectors/import_manifest.jsonl  # 向量库导入清单：[{pool,text,category,source}]
+    ├── vectors/import_manifest.jsonl         # 文本导入清单：[{pool,text,category,source}]
+    └── vectors/import_manifest_images.jsonl  # 图片导入清单：[{pool,text,image_path,source}]
 
 约定：
+- 图片语料（--images-dir，可多次指定）：按目录名 black/white 自动归属池（就近优先），
+  或用 --image-pool 显式指定；Pillow 校验（可读 + verify + 完整解码）通过的图片以
+  {pool,text:"",image_path,source:"images"} 逐行写入**独立** images 清单，不混入文本
+  清单（向后兼容；图文合并由主模型集成时决定）；重复路径去重、损坏文件跳过并列入报告。
 - 仅做文件级迁移，不做分词；node/data/keywords 目录下有什么就归一什么
   （.txt 每行一词；.csv 取「关键词/类型」列）。
 - 语料池：cherry 13 类中「正常」→ white（label=0），其余类别 → black（label=1）；
@@ -31,6 +36,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from PIL import Image
+
 logger = logging.getLogger("normalize_assets")
 
 OUTPUT_ENCODING = "utf-8-sig"
@@ -40,6 +47,11 @@ COMMENT_PREFIXES = ("#", "//")
 NORMAL_CATEGORY = "正常"
 KEYWORD_COL = "关键词"
 TYPE_COL = "类型"
+
+#: 图片语料可接受的扩展名（大小写不敏感）
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+#: 图片独立导入清单文件名（与文本 import_manifest.jsonl 分离，向后兼容）
+IMAGES_MANIFEST_FILE = "import_manifest_images.jsonl"
 
 DEFAULT_NODE_DATA = r"E:\语义+关键词检索违规匹配\node\data"
 DEFAULT_CHERRY_DATA = "开发/cherry文本分类/data"
@@ -83,6 +95,20 @@ class CorpusPoolStats:
     sources: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass
+class ImageStats:
+    """图片语料扫描统计（候选 / 去重 / 校验通过 / 跳过）。"""
+
+    scanned: int = 0
+    unique: int = 0
+    valid: int = 0
+    deduped: int = 0
+    invalid: int = 0
+    unclassified: int = 0
+    pools: dict[str, int] = field(default_factory=lambda: {"black": 0, "white": 0})
+    invalid_files: list[tuple[str, str]] = field(default_factory=list)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析命令行参数（全部路径参数化，不硬编码输出位置）。"""
     parser = argparse.ArgumentParser(
@@ -110,6 +136,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="向量库导入清单最大行数上限（0=全量；设置后黑白两池轮流取样保持均衡）",
+    )
+    parser.add_argument(
+        "--images-dir",
+        action="append",
+        metavar="DIR",
+        default=None,
+        help="递归扫描的图片目录（可多次指定）。归属池：--image-pool 显式指定；"
+        "缺省按文件所在目录名自动归属（路径中含 black→black、含 white→white，就近优先；"
+        "均不含则跳过并计入报告）。产物写入独立 data/vectors/import_manifest_images.jsonl，"
+        "不混入文本清单",
+    )
+    parser.add_argument(
+        "--image-pool",
+        choices=("black", "white"),
+        default=None,
+        help="图片归属池（black | white）；缺省时按 --images-dir 目录名自动归属",
     )
     return parser.parse_args(argv)
 
@@ -351,6 +393,122 @@ def write_manifest(out_dir: Path, rows: list[dict[str, str]]) -> None:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def scan_image_files(root: Path) -> list[Path]:
+    """递归扫描目录下全部图片扩展名文件（确定性排序，去重前）。"""
+    return sorted(
+        (p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS),
+        key=lambda p: str(p).lower(),
+    )
+
+
+def detect_pool(file_path: Path, explicit: str | None) -> str:
+    """确定图片归属池：``--image-pool`` 显式值优先，否则按文件目录名就近推断。
+
+    目录判断取文件绝对父目录链，从离文件最近的一级开始；任一段含 ``black`` → black、
+    含 ``white`` → white；两者都不含则抛 ValueError。
+
+    Args:
+        file_path: 图片文件路径。
+        explicit: ``--image-pool`` 参数值（black/white），None 表示未显式指定。
+
+    Raises:
+        ValueError: 无法从目录链推断归属池且未显式指定。
+    """
+    if explicit:
+        return explicit
+    for part in reversed(file_path.parent.parts):
+        low = part.lower()
+        if "black" in low:
+            return "black"
+        if "white" in low:
+            return "white"
+    raise ValueError(
+        f"无法从目录名推断归属池: {file_path}（目录链需含 black 或 white，"
+        "或用 --image-pool 显式指定）"
+    )
+
+
+def validate_image(path: Path) -> str | None:
+    """校验图片文件可读且 Pillow 可完整解码；返回错误描述，有效返回 None。"""
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        # verify() 只校验结构不解码像素，重新打开触发完整解码
+        with Image.open(path) as img:
+            img.load()
+            _ = img.size
+    except (OSError, ValueError) as exc:
+        return str(exc)
+    return None
+
+
+def collect_image_rows(
+    roots: list[Path], explicit_pool: str | None
+) -> tuple[list[dict[str, str]], ImageStats]:
+    """扫描并校验图片语料，产出图片清单行与统计。
+
+    清单行结构：``{"pool", "text": "", "image_path", "source": "images"}``；
+    ``image_path`` 为绝对路径（与本地消费方同一机器，词库/图片本体均不入库）。
+    重复路径（resolve 后大小写归一）仅保留首个；损坏 / 无法推断归属池的图片跳过并记录。
+
+    Args:
+        roots: ``--images-dir`` 给出的目录（须为已存在目录）。
+        explicit_pool: ``--image-pool`` 显式归属池，None 走目录名自动归属。
+
+    Returns:
+        (清单行列表, ImageStats)。
+
+    Raises:
+        ValueError: 任一目录不存在或不是目录。
+    """
+    rows: list[dict[str, str]] = []
+    stats = ImageStats()
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            raise ValueError(f"--images-dir 不是目录: {root}")
+        for path in scan_image_files(root):
+            stats.scanned += 1
+            key = str(path.resolve()).lower()
+            if key in seen:
+                stats.deduped += 1
+                continue
+            seen.add(key)
+            stats.unique += 1
+            try:
+                pool = detect_pool(path, explicit_pool)
+            except ValueError:
+                stats.unclassified += 1
+                logger.warning("跳过（无法推断归属池）: %s", path)
+                continue
+            err = validate_image(path)
+            if err is not None:
+                stats.invalid += 1
+                stats.invalid_files.append((str(path), err))
+                logger.warning("跳过损坏图片: %s（%s）", path, err)
+                continue
+            stats.valid += 1
+            stats.pools[pool] += 1
+            rows.append(
+                {
+                    "pool": pool,
+                    "text": "",
+                    "image_path": str(path.resolve()),
+                    "source": "images",
+                }
+            )
+    return rows, stats
+
+
+def write_image_manifest(out_dir: Path, rows: list[dict[str, str]]) -> None:
+    """写独立图片清单 data/vectors/import_manifest_images.jsonl（不覆盖文本清单）。"""
+    path = out_dir / "vectors" / IMAGES_MANIFEST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding=MANIFEST_ENCODING, newline="\n") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def format_report(
     args: argparse.Namespace,
     files: list[FileInfo],
@@ -413,6 +571,33 @@ def format_report(
     return "\n".join(lines)
 
 
+def format_image_report(
+    args: argparse.Namespace, stats: ImageStats, rows: list[dict[str, str]]
+) -> str:
+    """组装图片语料归一化统计报告（dry-run 与真实运行共用）。"""
+    lines = ["", "=" * 64, "图片语料归一化统计"]
+    mode = "dry-run（仅统计，不写盘）" if args.dry_run else "完整运行（覆盖写盘）"
+    lines.append(f"模式      : {mode}")
+    lines.append(f"扫描目录  : {', '.join(args.images_dir or [])}")
+    lines.append(f"候选文件  : 扫描 {stats.scanned}（重复路径去重后 {stats.unique}）")
+    lines.append(
+        f"有效图片  : {stats.valid}（black {stats.pools['black']} / "
+        f"white {stats.pools['white']}；损坏跳过 {stats.invalid}，"
+        f"无法分类跳过 {stats.unclassified}）"
+    )
+    if stats.invalid_files:
+        lines.append(f"[!] 损坏 / 无法打开的图片（跳过，共 {stats.invalid} 张）:")
+        for path, reason in stats.invalid_files[:10]:
+            lines.append(f"      - {path}: {reason}")
+        if len(stats.invalid_files) > 10:
+            lines.append(f"      - …等共 {len(stats.invalid_files)} 张")
+    lines.append(
+        f"清单      : {args.out}/vectors/{IMAGES_MANIFEST_FILE}（{len(rows)} 行，与文本清单分离）"
+    )
+    lines.append("=" * 64)
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     """归一化主流程：读取 → 统计 →（非 dry-run）覆盖写盘。"""
     # 报告可能含 GBK 之外的字符，统一 UTF-8 输出避免控制台编码崩溃
@@ -444,8 +629,27 @@ def main(argv: list[str] | None = None) -> int:
     keyword_grouped = group_keywords(keyword_rows)
     manifest_rows = build_manifest_rows(white, black, args.max_rows)
 
-    if not keyword_grouped and not white and not black:
-        logger.error("未发现任何可迁移的资产，请检查 --node-data 与 --cherry-data 路径")
+    image_rows: list[dict[str, str]] = []
+    image_stats: ImageStats | None = None
+    if args.images_dir:
+        try:
+            image_rows, image_stats = collect_image_rows(
+                [Path(d) for d in args.images_dir], args.image_pool
+            )
+        except ValueError as exc:
+            logger.error("%s", exc)
+            return 1
+
+    if not keyword_grouped and not white and not black and not image_rows:
+        if args.images_dir:
+            logger.error(
+                "--images-dir 未产出任何有效图片行（扫描 %s 个文件，有效 %s 个），"
+                "请检查图片目录与目录名 black/white",
+                image_stats.scanned if image_stats else 0,
+                len(image_rows),
+            )
+        else:
+            logger.error("未发现任何可迁移的资产，请检查 --node-data 与 --cherry-data 路径")
         return 1
 
     print(
@@ -460,6 +664,8 @@ def main(argv: list[str] | None = None) -> int:
             manifest_rows,
         )
     )
+    if image_stats is not None:
+        print(format_image_report(args, image_stats, image_rows))
     if args.dry_run:
         logger.info("dry-run 完成，未写任何文件")
         return 0
@@ -467,6 +673,8 @@ def main(argv: list[str] | None = None) -> int:
     write_keyword_csvs(Path(args.out), keyword_grouped)
     write_corpus_csvs(Path(args.out), white, black)
     write_manifest(Path(args.out), manifest_rows)
+    if image_rows:
+        write_image_manifest(Path(args.out), image_rows)
     logger.info("产物已写入 %s", Path(args.out).resolve())
     return 0
 

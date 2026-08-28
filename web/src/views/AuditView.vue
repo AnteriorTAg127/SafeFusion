@@ -1,10 +1,18 @@
 <script setup lang="ts">
 /**
- * 审核记录页（T24）：
+ * 审核记录页（T24 + T41 增强）：
  * - 筛选栏：时间范围（datetime-local）、结论（全部/违规/通过）、置信度区间
  *   （min/max）、文本哈希模糊；查询 / 重置
  * - DataTable + Pagination + 空态 + loading；点击行任意单元格呼出 AppModal 查看
- *   detail_json（JsonTree 递归渲染，Vue 插值自动转义，不用 innerHTML）
+ *   detail_json（T41：详情由 EvidencePanel（T37 组件）分层渲染，原始 JSON 折叠
+ *   由 EvidencePanel 内部承载；detail 为 null 时说明 standard 渠道不返回明细）
+ * - T41「⬇️ 导出 CSV」：按当前筛选调用既有导出端点 GET /admin/logs/export
+ *   （v0.1 T11：StreamingResponse + utf-8-sig BOM，过滤参数与 /admin/logs 一致，
+ *   无分页参数、全量流式）；响应为 CSV 文本，前端组装 blob 下载；
+ *   上限 10,000 行语义说明：后端不强制截断，前端在结果条数超过 1 万行时二次
+ *   确认并提示缩小范围（详见 exportHint 常量与 askExport）
+ * - T41「⟳ 自动刷新（10s）」：开关默认关，localStorage sf_audit_autorefresh 记忆；
+ *   开启后每 10 秒重拉当前页（保留筛选与页码），离开页面自动清除定时器
  *
  * 字段对齐（依据 src/safefusion/api/admin.py query_logs + _normalize_log、
  * storage/database.py audit_logs 表）：
@@ -13,23 +21,37 @@
  *   detail(dict|null，由 detail_json 解析而来), key_tier }] }
  *   降级标记列取 detail.degraded（orchestrator.py 写入 "semantic:<原因码>"）。
  *
+ * T41 EvidencePanel 对接（T37 组件，真实契约见 web/src/api/types.ts + EvidencePanel.vue）：
+ *   props: { result: AuditResult | null, loading?: boolean, durationMs?: number }
+ *   AuditView 把审计日志行映射为 AuditResult（auditResult computed）：
+ *   request_id←row.request_id、timestamp←row.ts、has_violation←row.has_violation、
+ *   confidence←row.confidence（空→0）、category←row.category、source←row.source
+ *   （窄化为 AuditSource 五值，未知兜底 semantic）、cache_hit←row.cache_hit（日志
+ *   无此列→false）、detail←row.detail（解析后的 AuditDetail 或 null）。
+ *   原始 JSON <details> 折叠由 EvidencePanel 内部承载（复用 JsonTree）。
+ *
  * 已知后端缺口（写入报告 TODO，由主模型集成阶段处理，本页不做后端改动）：
  * - 置信度区间 / 文本哈希过滤：/admin/logs 无对应查询参数（仅 start/end/
  *   has_violation/source/category/key_tier/basic 分页）→ 本页在启用这两类筛选
  *   时进入「客户端过滤模式」：循环拉取筛选窗口内全部记录（最多 40 页 × 500 =
  *   2 万条，超限截断近似），内存过滤后前端分页；未启用时走服务端分页。
+ *   导出端点同样不支持这两类参数 → 导出时忽略它们并在按钮 title 注明。
  * - 结论「需人工」：audit_logs 无该状态（仅 has_violation 0/1）→ 筛选栏仅
  *   提供 全部/违规/通过，第三态留 TODO。
  * - 错误响应体为 {error}（admin.py 全局异常处理器），而 api/client.ts 的
  *   readableError 只解析 {detail} → 错误 Toast 显示通用文案（对齐问题记录
- *   TODO，本页不修改 client.ts）。
+ *   TODO，本页不修改 client.ts；导出为直连 http 请求，本页内置双错误体解析）。
  */
-import { onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import DataTable from '../components/DataTable.vue'
+import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 import AppModal from '../components/AppModal.vue'
-import JsonTree from './components/JsonTree.vue'
-import { apiGet } from '../api/client'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
+import EvidencePanel from '../components/EvidencePanel.vue'
+import { apiGet, http } from '../api/client'
+import { useToastStore } from '../stores/toast'
+import type { AuditDetail, AuditResult, AuditSource } from '../api/types'
 
 interface LogsPage {
   total: number
@@ -65,6 +87,167 @@ const inClientMode = ref(false)
 // ---------- 明细弹窗 ----------
 const detailOpen = ref(false)
 const detailRow = ref<LogRow | null>(null)
+
+/** detail 对象（null → 说明 standard 渠道无明细） */
+const detailObj = computed<Record<string, unknown> | null>(() => {
+  const d = detailRow.value?.detail
+  return d && typeof d === 'object' ? (d as Record<string, unknown>) : null
+})
+
+/** AuditSource 合法值（schemas.Source 五值，用于 row.source 窄化） */
+const SOURCE_VALUES: readonly AuditSource[] = [
+  'semantic',
+  'llm',
+  'basic_rules_pass',
+  'cache',
+  'permanent_list',
+]
+
+/**
+ * 审计日志行 → EvidencePanel 可渲染的 AuditResult（T41 接线；
+ * 字段映射见文件头注释；面板内部再取 result.detail 分层渲染）
+ */
+const auditResult = computed<AuditResult | null>(() => {
+  const row = detailRow.value
+  if (!row) return null
+  const rawSource = textOf(row.source)
+  const source: AuditSource = (SOURCE_VALUES as readonly string[]).includes(rawSource)
+    ? (rawSource as AuditSource)
+    : 'semantic'
+  return {
+    request_id: textOf(row.request_id),
+    timestamp: textOf(row.ts),
+    has_violation: isViolation(row),
+    confidence: typeof row.confidence === 'number' ? row.confidence : 0,
+    category: typeof row.category === 'string' && row.category ? row.category : null,
+    source,
+    cache_hit: row.cache_hit === true,
+    detail: detailObj.value as AuditDetail | null,
+  }
+})
+
+// ---------- T41：自动刷新（10s，默认关，localStorage 记忆） ----------
+const AUTO_REFRESH_KEY = 'sf_audit_autorefresh'
+const AUTO_REFRESH_MS = 10_000
+
+const autoRefresh = ref(localStorage.getItem(AUTO_REFRESH_KEY) === '1')
+let refreshTimer: number | undefined
+const toast = useToastStore()
+
+function applyAutoRefresh(enable: boolean): void {
+  if (enable) {
+    if (refreshTimer === undefined) {
+      refreshTimer = window.setInterval(() => {
+        void loadData() // 定时重拉当前页（保留筛选与页码）
+      }, AUTO_REFRESH_MS)
+    }
+    localStorage.setItem(AUTO_REFRESH_KEY, '1')
+  } else {
+    if (refreshTimer !== undefined) {
+      window.clearInterval(refreshTimer)
+      refreshTimer = undefined
+    }
+    localStorage.removeItem(AUTO_REFRESH_KEY)
+  }
+}
+
+watch(autoRefresh, (enabled) => {
+  applyAutoRefresh(enabled)
+  toast.info(enabled ? '已开启自动刷新（每 10 秒）' : '已关闭自动刷新')
+})
+
+// ---------- T41：CSV 导出 ----------
+/** 导出行数上限（PRD §M9 G5 语义说明；后端 /logs/export 不强制截断，前端提示性约定） */
+const EXPORT_MAX_ROWS = 10_000
+/** 导出按钮 hover 提示：说明端点契约与上限语义 */
+const exportHint =
+  '按当前筛选（时间 / 结论；置信度与文本哈希为客户端过滤，导出不支持）下载 CSV。' +
+  '导出端点 GET /admin/logs/export 为全量流式（utf-8-sig BOM，Excel 兼容），' +
+  `建议单次 ≤ ${EXPORT_MAX_ROWS.toLocaleString()} 行，超出时先缩小时间范围。`
+
+const exporting = ref(false)
+/** 结果条数超过上限时的二次确认弹窗 */
+const exportWarnOpen = ref(false)
+
+/** 当前筛选对应的导出/查询参数（与 loadData 服务端参数一致） */
+function exportParams(): Record<string, unknown> {
+  const hasV = conclusion.value === '' ? undefined : conclusion.value === 'true'
+  return {
+    start: toIso(startTime.value),
+    end: toIso(endTime.value),
+    has_violation: hasV,
+  }
+}
+
+/** 当前已知结果条数（服务端模式 = total；客户端过滤模式 = 内存累计） */
+function currentFilteredCount(): number {
+  return inClientMode.value ? clientRows.value.length : total.value
+}
+
+function askExport(): void {
+  if (currentFilteredCount() > EXPORT_MAX_ROWS) {
+    exportWarnOpen.value = true
+  } else {
+    void runExport()
+  }
+}
+
+/** 下载 CSV 文本为本地文件（blob + 临时 <a>；CSV 已含 BOM，无需补） */
+function downloadCsv(text: string, filename: string): void {
+  const blob = new Blob([text], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+/** 直连 http 的导出错误文案（镜像 client.readableError 的 {detail}/{error} 双错误体） */
+function exportErrorText(error: unknown): string {
+  const data = (error as { response?: { data?: unknown } } | undefined)?.response?.data
+  if (data && typeof data === 'object') {
+    const detail = (data as { detail?: unknown }).detail
+    if (typeof detail === 'string') return `导出失败：${detail}`
+    const errMsg = (data as { error?: unknown }).error
+    if (typeof errMsg === 'string') return `导出失败：${errMsg}`
+  }
+  return `导出失败：${error instanceof Error ? error.message : '请稍后重试'}`
+}
+
+async function runExport(): Promise<void> {
+  exporting.value = true
+  try {
+    const res = await http.get<string>('/logs/export', {
+      params: exportParams(),
+      responseType: 'text',
+      timeout: 60_000, // 大结果集导出放宽超时
+    })
+    const csv = res.data
+    // 行数统计：去 BOM 后按行切分，第 1 行表头，其余为数据行
+    // （detail_json 为 json.dumps 输出，字符串内换行已转义，按 \n 切分安全）
+    const dataRows = csv.replace(/^\uFEFF/, '').split('\n').filter((line) => line.trim() !== '').length - 1
+    const now = new Date()
+    const stamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+    ].join('') + '_' + [String(now.getHours()).padStart(2, '0'), String(now.getMinutes()).padStart(2, '0'), String(now.getSeconds()).padStart(2, '0')].join('')
+    downloadCsv(csv, `audit_logs_${stamp}.csv`)
+    toast.success(
+      dataRows > EXPORT_MAX_ROWS
+        ? `已导出 ${dataRows} 条（超过 ${EXPORT_MAX_ROWS.toLocaleString()} 行建议，请缩小筛选范围分次导出）`
+        : `已导出 ${dataRows} 条记录`,
+    )
+  } catch (error) {
+    toast.error(exportErrorText(error))
+    console.warn('[AuditView] 导出 CSV 失败：', error)
+  } finally {
+    exporting.value = false
+  }
+}
 
 // ---------- 工具 ----------
 /** datetime-local（本地时区）→ UTC ISO；空值返回 undefined（axios 会省略该参数） */
@@ -225,6 +408,15 @@ function closeDetail(): void {
 
 onMounted(() => {
   void loadData()
+  // 页面加载时若 localStorage 记忆为开启状态 → 直接启动定时器（watch 不会对初始值触发）
+  if (autoRefresh.value) applyAutoRefresh(true)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer !== undefined) {
+    window.clearInterval(refreshTimer)
+    refreshTimer = undefined
+  }
 })
 
 // ---------- 列定义（DataTable 结构类型传入；degraded 为派生列） ----------
@@ -241,6 +433,10 @@ const columns = [
 <template>
   <section class="page-view">
     <h2 class="page-title">🔍 审核记录</h2>
+    <p class="page-hint">
+      查看历史审核结论与命中证据链（点击任一单元格展开明细）；上方筛选栏可组合时间 / 结论 / 置信度 / 文本哈希查询，
+      记录来自审核 API（POST /v1/audit）的每次调用。
+    </p>
 
     <!-- 筛选栏 -->
     <div class="card filter-card">
@@ -288,9 +484,33 @@ const columns = [
     <div class="card">
       <div class="card-title">
         <span>🕘 审核记录（共 {{ total }} 条）</span>
-        <span v-if="inClientMode" class="mode-note">客户端过滤模式（内存分页）</span>
+        <span class="title-right">
+          <span v-if="inClientMode" class="mode-note">客户端过滤模式（内存分页）</span>
+          <label class="auto-toggle" :title="'开启后每 10 秒自动重拉当前页（保留筛选与页码），状态记忆于本地'">
+            <input v-model="autoRefresh" type="checkbox" />
+            <span>⟳ 自动刷新（10s）</span>
+          </label>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :disabled="exporting || loading"
+            :title="exportHint"
+            @click="askExport"
+          >
+            {{ exporting ? '导出中…' : '⬇️ 导出 CSV' }}
+          </button>
+        </span>
       </div>
-      <DataTable :columns="columns" :rows="rows" :loading="loading" empty-text="暂无审核记录">
+      <DataTable :columns="columns" :rows="rows" :loading="loading">
+        <template #empty>
+          <EmptyState
+            icon="📭"
+            title="暂无审核记录"
+            :hint="'审核记录来自审核 API 的调用，产生记录后会按筛选条件显示在这里。\n可以先到「试运行」一键示例文本、当场看到分层结果，或参考顶栏「指南」中的 API 对接示例发起第一条审核请求。'"
+            action-text="去试运行看看"
+            to="trial"
+          />
+        </template>
         <template #cell="{ row, column }">
           <!-- 点击任意单元格 = 查看该行明细（DataTable 无行点击插槽，以全单元格委托等效实现） -->
           <div class="cell-click" @click="openDetail(row)">
@@ -321,8 +541,8 @@ const columns = [
       <Pagination :page="page" :page-size="PAGE_SIZE" :total="total" @change="onPageChange" />
     </div>
 
-    <!-- 明细弹窗：detail_json 树（JsonTree，textContent 安全渲染） -->
-    <AppModal :show="detailOpen" title="审核明细（detail_json）" @close="closeDetail">
+    <!-- 明细弹窗：T41 由 EvidencePanel（T37 共享组件）分层渲染，原始 JSON 折叠由组件承载 -->
+    <AppModal :show="detailOpen" title="审核明细（证据面板）" @close="closeDetail">
       <div v-if="detailRow" class="detail-meta">
         <div><span class="dl">请求 ID：</span>{{ textOf(detailRow.request_id) }}</div>
         <div><span class="dl">时间：</span>{{ fmtTime(detailRow.ts) }}</div>
@@ -334,19 +554,37 @@ const columns = [
           <span class="dl">降级：</span><span class="tag tag-danger">{{ degradedOf(detailRow) }}</span>
         </div>
       </div>
-      <div class="detail-title">明细 JSON（只读，点击关闭）</div>
-      <p v-if="detailRow && detailRow.detail === null" class="detail-null">
+      <p v-if="detailObj === null" class="detail-null">
         detail 为 null —— 请求使用 standard 渠道 Key 时后端不返回明细（仅 full 组返回）。
       </p>
-      <JsonTree v-else :value="detailRow ? detailRow.detail : null" />
+      <!-- 面板传 AuditResult（行映射见 auditResult）；detail=null 时面板内部渲染
+           「无分层证据」分支兜底，仍展示判定总览与原始 JSON -->
+      <EvidencePanel :result="auditResult" />
       <template #actions>
         <button type="button" class="btn btn-primary" @click="closeDetail">关闭</button>
       </template>
     </AppModal>
+
+    <!-- 导出超 1 万行的二次确认（上限语义说明） -->
+    <ConfirmDialog
+      :show="exportWarnOpen"
+      title="⚠️ 导出结果较大"
+      :message="`当前筛选结果约 ${currentFilteredCount().toLocaleString()} 行，超过建议上限 ${EXPORT_MAX_ROWS.toLocaleString()} 行（PRD G5）。导出端点按后端实现为全量流式，文件可能较大；建议先缩小时间范围/结论筛选。仍要继续导出吗？`"
+      @confirm="exportWarnOpen = false; void runExport()"
+      @cancel="exportWarnOpen = false"
+    />
   </section>
 </template>
 
 <style scoped>
+/* 标题下操作提示行（PRD v0.3.0 §M1：每页用途 + 主操作） */
+.page-hint {
+  font-size: 0.76rem;
+  color: var(--text-3);
+  line-height: 1.7;
+  margin: -8px 0 14px;
+}
+
 .filter-card {
   margin-bottom: 16px;
 }
@@ -388,6 +626,30 @@ const columns = [
   font-size: 0.72rem;
   color: var(--text-3);
   font-weight: 400;
+}
+
+/* T41：卡片标题右侧操作区（自动刷新开关 + 导出按钮） */
+.title-right {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.auto-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.auto-toggle input {
+  accent-color: var(--primary);
+  cursor: pointer;
 }
 
 /* 整行可点击（等效「点击行 → 查看明细」） */
@@ -445,13 +707,6 @@ const columns = [
 .dl {
   color: var(--text-3);
   font-weight: 600;
-}
-
-.detail-title {
-  font-size: 0.78rem;
-  font-weight: 700;
-  color: var(--text-2);
-  margin: 6px 0 8px;
 }
 
 .detail-null {

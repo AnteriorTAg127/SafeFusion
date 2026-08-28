@@ -126,9 +126,26 @@ class TestKeysEndpoints:
         db.create_key("sf_del_me")
         resp = client.delete("/admin/keys/sf_del_me", headers=_headers())
         assert resp.status_code == 200
-        assert resp.json()["deleted"] == "sf_del_me"
+        assert resp.json()["deleted"].startswith("sf_del_m")  # 脱敏回显（明文仅创建时一次）
         assert db.get_key("sf_del_me") is None
         assert client.delete("/admin/keys/sf_del_me", headers=_headers()).status_code == 404
+
+    def test_delete_key_by_masked_prefix(self, admin_env) -> None:
+        """列表回显的是 key[:8]+… 脱敏前缀：PATCH/DELETE 应按前缀唯一匹配定位（v0.3.0 补强）。"""
+        db, client = admin_env
+        db.create_key("sf_prefix_key_1")
+        db.create_key("sf_other_key_zz")
+        resp = client.patch("/admin/keys/sf_prefix…", json={"enabled": False}, headers=_headers())
+        assert resp.status_code == 200  # 前缀唯一 → 定位成功
+        assert db.get_key("sf_prefix_key_1")["enabled"] == 0
+        # 前缀歧义 → 400 可读错误
+        db.create_key("sf_other_key_ab")
+        resp2 = client.patch("/admin/keys/sf_other", json={"enabled": True}, headers=_headers())
+        assert resp2.status_code == 400
+        # 删除按前缀
+        resp3 = client.delete("/admin/keys/sf_prefix", headers=_headers())
+        assert resp3.status_code == 200
+        assert db.get_key("sf_prefix_key_1") is None
 
     def test_patch_validation_422_masked(self, admin_env) -> None:
         _, client = admin_env
@@ -516,3 +533,45 @@ class TestRebuildEndpoints:
         assert resp.status_code == 500
         assert "error" in resp.json()
         db.close()
+
+
+class TestKeywordsDedup:
+    """POST /admin/keywords/dedup：自动备份 zip + 变体去重 + 引擎重载语义（v0.3.0 G10）。
+
+    keywords 表有 UNIQUE(category, word)，精确重复不存在；去重按
+    (类别, 归一化词) 清理全半角/空白/标点变体。
+    """
+
+    def test_dedup_removes_variants_with_backup(self, admin_env, tmp_path: Path) -> None:
+        db, client = admin_env
+        db.add_keywords([("测试", "敏感词", "src1")])
+        # 变体词条（UNIQUE 约束下允许）：全角/空白/标点 → 归一化后与「敏感词」重复
+        db.add_keywords([("测试", "敏感词！", "src2"), ("测试", "敏 感词", "src3")])
+        resp = client.post("/admin/keywords/dedup", headers=_headers())
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["before"] == 3 and body["removed"] == 2 and body["after"] == 1
+        assert body["failed"] == 0
+        assert body["reload"] == "skipped"  # 夹具未注入容器
+        assert body["backup_file"].endswith(".zip")
+        # 备份压缩包存在且内含全量 CSV（去重前的 3 行）
+        import zipfile
+
+        backup = tmp_path / "backups" / body["backup_file"]
+        assert backup.is_file()
+        with zipfile.ZipFile(backup) as zf:
+            content = zf.read("keywords.csv").decode("utf-8")
+        assert content.count("src") == 3  # 备份含去重前全部 3 条（按 source 标记计数）
+        # 保留最小 id 的原始词条
+        rows = db.list_keywords()
+        assert len(rows) == 1 and rows[0]["source"] == "src1"
+
+    def test_dedup_no_duplicates_still_backs_up(self, admin_env, tmp_path: Path) -> None:
+        db, client = admin_env
+        db.add_keywords([("测试", "仅一条", "s")])
+        resp = client.post("/admin/keywords/dedup", headers=_headers())
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["removed"] == 0 and body["backup_file"].endswith(".zip")
+        assert (tmp_path / "backups" / body["backup_file"]).is_file()

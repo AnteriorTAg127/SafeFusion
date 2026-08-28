@@ -24,6 +24,7 @@
  */
 import { onMounted, ref } from 'vue'
 import StatCard from '../components/StatCard.vue'
+import EmptyState from '../components/EmptyState.vue'
 import { apiGet, apiPost } from '../api/client'
 import { useToastStore } from '../stores/toast'
 
@@ -144,6 +145,10 @@ onMounted(() => {
 <template>
   <section class="page-view">
     <h2 class="page-title">⏱️ 定时复核</h2>
+    <p class="page-hint">
+      用 LLM 二次判定抽样复核审核记录中置信度中带样本，产出一致率与阈值建议，辅助校准判定阈值。
+      主操作 = 「🚀 立即复核」；interval_min &gt; 0 时按分钟自动执行。
+    </p>
 
     <!-- 状态卡片 -->
     <div class="stats-grid">
@@ -199,8 +204,13 @@ onMounted(() => {
       <div v-if="loading" class="loading">加载中...</div>
 
       <div v-else-if="!status?.last_report" class="empty-state">
-        <span class="empty-icon">📭</span>
-        <p>暂无复核报告：点击「立即复核」触发一轮（interval_min &gt; 0 时后台自动执行）</p>
+        <EmptyState
+          icon="📄"
+          title="暂无复核报告"
+          :hint="'复核从审核记录中采样置信度中带（band_low~band_high）样本，LLM 二次判定后产出一致率与阈值建议。\n点击「立即复核」触发一轮；在系统设置「定时复核」分组把 interval_min 设为大于 0 即可按分钟自动执行。无 LLM 密钥时报告会标记跳过（llm_unavailable）。'"
+          action-text="立即复核"
+          @action="runReview"
+        />
       </div>
 
       <template v-else>
@@ -259,6 +269,14 @@ onMounted(() => {
 </template>
 
 <style scoped>
+/* 标题下操作提示行（PRD v0.3.0 §M1：每页用途 + 主操作） */
+.page-hint {
+  font-size: 0.76rem;
+  color: var(--text-3);
+  line-height: 1.7;
+  margin: -8px 0 14px;
+}
+
 .desc-text {
   font-size: 0.8rem;
   color: var(--text-2);

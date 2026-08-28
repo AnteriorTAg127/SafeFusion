@@ -9,6 +9,8 @@ import { useToastStore } from '../stores/toast'
 /**
  * 登录页：输入管理 Token，调 GET /admin/config（带 X-Admin-Token）验证。
  * 成功 → 存 token 并跳转（优先跳回来源页）；401 → 错误 Toast。
+ * 底部含令牌说明块（PRD v0.3.0 §M1）：令牌来源 = 配置 admin_token / 环境变量
+ * ADMIN_PASSWORD；两者皆缺时启动日志打印一次性临时令牌（仅此一次）。
  */
 const route = useRoute()
 const router = useRouter()
@@ -65,6 +67,22 @@ async function handleLogin(): Promise<void> {
       <button type="button" class="btn btn-primary login-btn" :disabled="loading" @click="handleLogin">
         {{ loading ? '验证中...' : '登 录' }}
       </button>
+
+      <!-- 令牌说明（PRD v0.3.0 §M1；依据 api/admin.py _resolve_admin_token 实际逻辑） -->
+      <div class="login-token-block">
+        <div class="token-title">💡 管理令牌从哪来？</div>
+        <ul class="token-list">
+          <li>管理令牌取自配置 <code>admin_token</code> 或环境变量 <code>ADMIN_PASSWORD</code>；登录时原样输入即可。</li>
+          <li>两者都未设置时，<b>服务启动日志会打印一次随机生成的临时令牌（仅此一次输出）</b>，
+            请在启动终端中查找「自动生成管理令牌」字样；重启后令牌会变化，需重新获取。</li>
+        </ul>
+        <div class="token-title token-faq">常见问题</div>
+        <ul class="token-list">
+          <li><b>「Token 无效」</b>：令牌错误或已过期（如改了 ADMIN_PASSWORD 后仍用旧令牌），换新令牌重试。</li>
+          <li><b>「无法连接管理服务」</b>：后端未启动 / 端口不通（管理 API 默认 :8001），与服务无关。</li>
+          <li>令牌仅保存在本浏览器 localStorage；不会在任何页面回显明文。</li>
+        </ul>
+      </div>
     </div>
   </div>
 </template>
@@ -117,5 +135,41 @@ async function handleLogin(): Promise<void> {
   justify-content: center;
   padding: 10px 0;
   font-size: 0.92rem;
+}
+
+/* 令牌说明块（登录页底部） */
+.login-token-block {
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+  text-align: left;
+}
+
+.token-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+
+.token-faq {
+  margin-top: 12px;
+}
+
+.token-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 0.7rem;
+  color: var(--text-3);
+  line-height: 1.8;
+}
+
+.token-list code {
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 0.66rem;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 }
 </style>

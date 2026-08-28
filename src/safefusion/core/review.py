@@ -673,6 +673,16 @@ class ReviewScheduler:
         self._loop.call_soon_threadsafe(self._stop_event.set)
         self._thread.join(timeout=5)
 
+    def reload_llm(self, llm: Any) -> None:
+        """热替换复核器专用 LLM 客户端（PRD v0.3.0 M4 C，线程安全）。
+
+        每一轮复核开始时才读取 ``self._llm``（``_run_once``），故本方法只做
+        单次属性赋值：正在执行的轮次继续用已捕获的旧客户端引用，之后的轮次
+        自动使用新客户端——调度线程与替换线程之间无竞态窗口。
+        """
+
+        self._llm = llm
+
     def _thread_main(self) -> None:
         """调度线程入口：运行自动调度循环直到 stop（异常退出不静默）。"""
 

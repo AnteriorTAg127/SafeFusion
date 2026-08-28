@@ -175,7 +175,9 @@ class AuditOrchestrator:
 
         if ctx.keyword_engine is not None and normalized:
             raw_hits = ctx.keyword_engine.scan(normalized)
-            kept_hits, exempted = ctx.keyword_engine.disambiguate(normalized, raw_hits)
+            kept_hits, exempted = ctx.keyword_engine.disambiguate(
+                normalized, raw_hits, [hit.keyword for hit in raw_hits]
+            )
             keyword_detail = {
                 "hits": [dict(hit._asdict()) for hit in kept_hits],
                 "regex_filtered": [_exempted_to_dict(item) for item in exempted],
@@ -227,7 +229,7 @@ class AuditOrchestrator:
             return result
 
         # ---------- ⑧ 语义检索（降级 ≠ 安全） ----------
-        semantic_result = self._run_semantic(normalized or None, frames, ov)
+        semantic_result = await self._run_semantic(normalized or None, frames, ov)
         semantic_detail = _semantic_detail(semantic_result)
         if detail_payload is not None:
             detail_payload["semantic"] = semantic_detail
@@ -343,14 +345,23 @@ class AuditOrchestrator:
                 cache_layer.put_short_text_llm(text_hash, verdict)
         return verdict
 
-    def _run_semantic(
+    async def _run_semantic(
         self, text: str | None, frames: list[Image.Image], ov: dict[str, Any]
     ) -> dict[str, Any]:
-        """执行语义检索；引擎缺失 / 异常均返回带 reason 的降级结果。"""
+        """执行语义检索；引擎缺失 / 异常均返回带 reason 的降级结果。
 
+        懒加载（PRD v0.3.0 M6）：语义层尚未装配且处于可自动装配等待态时，
+        经 ``AppContext.ensure_semantic_async`` 单飞触发装配并在超时前等待
+        （缓存命中装载为秒级）；装配失败 / 超时快速返回降级结果（原因码
+        ``lazy_pending`` / ``embedding_error`` 等），不阻塞请求超时。
+        """
+
+        ctx = self.context
+        if ctx.semantic is None and ctx.semantic_pending():
+            await ctx.ensure_semantic_async()
         semantic = self.context.semantic
         if semantic is None:
-            return _semantic_degraded("semantic_disabled")
+            return _semantic_degraded(ctx.semantic_degraded_reason() or "semantic_disabled")
         try:
             result = semantic.audit(text, frames, ov)
             if not isinstance(result, dict):

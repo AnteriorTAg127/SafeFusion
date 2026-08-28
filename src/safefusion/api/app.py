@@ -149,7 +149,7 @@ def _require_api_key(db: Any) -> Callable[..., dict[str, Any]]:
     return _dependency
 
 
-def build_container(config: AppConfig) -> AppContext:
+def build_container(config: AppConfig, database: Any = None) -> AppContext:
     """装配共享组件容器（``AppContext.build``）并对降级组件清单打 warning。
 
     供 :func:`create_app` 与 ``api/__main__.py`` 复用——同一进程内两个应用
@@ -157,12 +157,14 @@ def build_container(config: AppConfig) -> AppContext:
 
     Args:
         config: 已加载的应用总配置。
+        database: 可选已建 ``Database`` 实例（v0.3.0 启动迁移复用连接）；
+            None 时由 ``AppContext.build`` 自行创建。
 
     Returns:
         装配完成的 ``AppContext``（``degraded`` 字段列出未成功装配的组件名）。
     """
 
-    container = AppContext.build(config)
+    container = AppContext.build(config, database=database)
     if container.degraded:
         logger.warning("组件降级清单: %s", ", ".join(container.degraded))
     return container

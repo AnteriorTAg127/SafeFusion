@@ -1,7 +1,14 @@
 """审核 API 契约测试（FastAPI TestClient）：鉴权 / 分级裁剪 / 限流 / health / 脱敏。
 
 对应 T10 任务卡验收：401/403/429、standard/full 分级裁剪 detail、
-overrides 权限、health 免认证。容器为真实降级装配（无 torch → 无 embedding/semantic）。
+overrides 权限、health 免认证。容器为真实降级装配。
+
+环境说明（T30B 适配，2026-08-28）：PRD v0.3.0 M6 起 ``AppContext.build``
+**不再启动即装载模型**（懒加载：只保存建造参数，语义层 lazy 占位）——
+无论本环境是否具备 ML 依赖与模型缓存，build 后 ``embedding`` / ``semantic``
+恒为 None、``degraded`` 恒含 embedding+semantic（原因码 lazy_pending，
+见 /admin/models 与 /admin/health）。旧「无 torch 降级」环境自适应断言改为
+固定懒加载契约断言。
 """
 
 from __future__ import annotations
@@ -150,8 +157,12 @@ class TestHealth:
         body = resp.json()
         assert body["status"] == "ok"
         assert body["version"] == "0.1.0"
-        assert "embedding" in body["degraded"]  # 本环境无 torch → 降级
-        assert "semantic" in body["degraded"]
+        degraded = body["degraded"]
+        assert "llm" in degraded  # 密钥未配置恒降级
+        # PRD v0.3.0 M6 懒加载：build 不装载模型 → embedding/semantic 恒为
+        # 待装配（lazy_pending），degraded 恒含二者（与 /admin/health 同口径）
+        assert "embedding" in degraded
+        assert "semantic" in degraded
         assert body["cache"]["audit_cache"]["enabled"] is True
         assert body["uptime_s"] >= 0
 
@@ -229,11 +240,14 @@ class TestAppContextBuild:
         assert ctx.store is not None
         assert ctx.whitelist is not None
         assert ctx.light_model is not None and ctx.light_model.disabled is True
-        # 无 torch / 无 Key → 多模态组件降级为 None 且计入 degraded
+        # PRD v0.3.0 M6 懒加载：build 永不装载模型（不触网 / 不实例化），
+        # embedding/semantic 恒为 None 且计入 degraded（lazy_pending）
         assert ctx.embedding is None
         assert ctx.semantic is None
+        assert "embedding" in ctx.degraded
+        assert "semantic" in ctx.degraded
         assert ctx.llm is None or ctx.llm.available is False
-        for name in ("embedding", "semantic", "llm", "light_model"):
+        for name in ("llm", "light_model"):
             assert name in ctx.degraded
 
     def test_keywords_loaded_into_engine(self, tmp_path: Path) -> None:

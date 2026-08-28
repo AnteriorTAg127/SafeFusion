@@ -8,6 +8,13 @@
   实现回映射（支持同音词场景，如词库「捡闻」命中正文「见闻」）。
 - ``RegexRuleEngine``：正则语境消歧。exempt 规则命中命中片段上下文时豁免该
   命中；violate 规则在全文命中时追加为强命中（类别取规则值）。
+- 正则规则索引（PRD v0.3.0）：``RegexRuleEngine`` 加载时从每条 pattern 提取
+  「关键短语」（连续汉字串 / 连续 ASCII 字母数字串，长度≥2）建倒排索引，
+  ``disambiguate`` 可选接收 ``hit_words`` 命中词提示，只对「短语出现在原文」
+  的规则子集执行 regex 扫描；**正确性优先、索引仅为加速** —— 可索引裁剪的
+  规则仅在「必然不匹配」时才跳过（跳过条件：规则可证明"命中必含某短语"且
+  该短语未在原文出现），其余规则（短语为空 / 判定构造含可缩量词 / 字符类等）
+  一律回退全量扫描，判定结果与旧行为完全一致。
 - ``generate_variants``：独立变体生成函数，供词库构建与测试复用。
 
 设计决策：
@@ -26,6 +33,7 @@
 
 import re
 import threading
+from collections.abc import Iterable
 from typing import Literal, NamedTuple
 
 import ahocorasick
@@ -114,6 +122,61 @@ _VariantKind = Literal[
 ]
 
 _CJK_RE = r"[\u4e00-\u9fff]+"
+
+#: 关键短语提取：连续汉字串或连续 ASCII 字母数字串（长度≥2）
+_LITERAL_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}")
+
+#: 可索引裁剪威胁①：字面量短语的尾字符被 * / ? / {0..} 修饰 → 该字符可缩减到
+#: 零次出现，「命中必含该短语」不成立（如 ``ab*`` 可只命中 ``a``）。
+_OPTIONAL_TAIL_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9](?:[*?]|\{\s*0(?:\s*,\s*\d*\s*)?\})")
+
+#: 可索引裁剪威胁②：含短语的分组整体被 * / ? / {0..} 修饰 → 整组可出现零次。
+_OPTIONAL_GROUP_RE = re.compile(r"\)(?:[*?]|\{\s*0(?:\s*,\s*\d*\s*)?\})")
+
+
+def _strip_regex_escapes(pattern: str) -> str:
+    """去掉正则转义序列（``\\x`` → ``x``），便于在原始文本上做字面量分析。
+
+    ``\\d`` 脱去反斜杠后残留的 ``d`` 是单字符（不足 2 字符不会被当作短语），
+    仅用于让后续的字符类 / 量词分析在无转义干扰的文本上进行。
+    """
+
+    return re.sub(r"\\.", "", pattern)
+
+
+def _analyze_pattern(pattern: str) -> tuple[frozenset[str], bool]:
+    """分析一条正则 pattern，返回 ``(关键短语集合, 是否可索引裁剪)``。
+
+    关键短语（候选字面量表）：去掉转义并在剔除量词花括号后（避免 ``{5,12}``
+    中的数字被误当成字面量短语），抽取连续汉字串与连续 ASCII 字母数字串
+    （长度≥2），全部小写。
+
+    可索引裁剪（indexable）：短语集合非空，且 pattern 中不存在任何「可能让
+    某个短语匹配成功却不作为文本连续片段出现」的构造 —— 字符类、字面量尾
+    字符被 ``*`` / ``?`` / ``{0..}`` 修饰、或含短语的分组整体被 ``*`` /
+    ``?`` / ``{0..}`` 修饰。凡是无法证明「命中必含某短语」的 pattern 一律
+    返回 indexable=False：该规则不做索引裁剪，永远全量扫描。
+
+    ``indexable=True`` 的规则满足：**规则命中原文 ⇒ 至少一个关键短语以
+    连续子串形式出现在原文中**（大小写不敏感）。因此当全部短语都未在原文
+    出现时，该规则必然不命中，可以安全跳过 —— 这是索引裁剪的唯一依据。
+
+    Args:
+        pattern: 正则 pattern 原始字符串。
+
+    Returns:
+        (小写关键短语集合, 是否可索引裁剪)。
+    """
+
+    cleaned = _strip_regex_escapes(pattern or "")
+    threatened = (
+        "[" in cleaned
+        or _OPTIONAL_TAIL_RE.search(cleaned) is not None
+        or _OPTIONAL_GROUP_RE.search(cleaned) is not None
+    )
+    no_quantifier_braces = re.sub(r"\{[^{}]*\}", "", cleaned)
+    phrases = frozenset(run.lower() for run in _LITERAL_RUN_RE.findall(no_quantifier_braces))
+    return phrases, bool(phrases) and not threatened
 
 
 class KeywordHitData(NamedTuple):
@@ -368,13 +431,19 @@ class KeywordEngine:
         )
 
     def disambiguate(
-        self, text: str, hits: list[KeywordHitData]
+        self,
+        text: str,
+        hits: list[KeywordHitData],
+        hit_words: Iterable[str] | None = None,
     ) -> tuple[list[KeywordHitData], list[dict]]:
         """对关键词命中执行正则消歧（规则层未启用时直接透传）。
 
         Args:
             text: 原文。
             hits: 关键词命中列表。
+            hit_words: 原文命中词（来自 :meth:`scan`），透传给
+                ``RegexRuleEngine.disambiguate`` 作为命中词索引的加速提示；
+                仅加速不改变判定（正确性契约见 RegexRuleEngine）。
 
         Returns:
             (保留命中, 被豁免命中列表)；规则层关闭（``rules_enabled`` 为 False）
@@ -383,7 +452,7 @@ class KeywordEngine:
 
         if not self._rules_enabled:
             return list(hits), []
-        return self._regex.disambiguate(text, hits)
+        return self._regex.disambiguate(text, hits, hit_words)
 
     def scan(self, text: str) -> list[KeywordHitData]:
         """扫描文本，返回全部关键词命中。
@@ -450,6 +519,17 @@ class RegexRuleEngine:
       命中类别一致时（规则未声明类别则作用于全部命中），豁免该命中；
     - violate：规则在全文任意位置命中时，追加一条强命中（category 取规则值，
       keyword 取 pattern）。
+
+    命中词索引（正确性优先，索引仅为加速）：加载时从每条 pattern 提取
+    「关键短语」（连续汉字串 / 连续 ASCII 字母数字串，长度≥2，见
+    :func:`_analyze_pattern`），构建「短语 → 规则」倒排索引与短语 AC 自动机。
+    :meth:`disambiguate` 可选接收 ``hit_words`` 命中词提示，只对「关键短语
+    出现在原文（大小写不敏感）或含于命中词」的规则子集执行 regex 扫描；
+    其余规则仅在**可证明必然不匹配**（``indexable`` 且全部短语未在原文出现）
+    时跳过，否则回退全量扫描 —— 判定结果与逐条全量扫描完全一致，索引只
+    减少必然会落空的 regex.search 调用。实例由 ``KeywordEngine.reload`` 在
+    模块级锁外完整构造后一次性原子替换，生产路径不存在对在线实例的并发
+    变更（``load`` 仅用于构造阶段或测试）。
     """
 
     def __init__(self, context_window: int = _DEFAULT_CONTEXT_WINDOW) -> None:
@@ -462,6 +542,11 @@ class RegexRuleEngine:
         self._context_window = max(0, int(context_window))
         self._exempt_rules: list[dict] = []
         self._violate_rules: list[dict] = []
+        #: 关键短语(小写) → 规则对象列表 的倒排索引（加载时构建）
+        self._phrase_index: dict[str, list[dict]] = {}
+        #: 全部关键短语构成的 AC 自动机：对原文一次性枚举出现的全部短语
+        #: （避免 ``"a|b"`` 组合正则 + finditer 在重叠短语下漏报子串）
+        self._phrase_automaton: ahocorasick.Automaton | None = None
 
     def load(self, rules: list[dict]) -> None:
         """加载消歧规则（重复调用会覆盖旧规则）。
@@ -486,10 +571,17 @@ class RegexRuleEngine:
                 compiled = re.compile(pattern)
             except (re.error, TypeError) as exc:
                 raise ValueError(f"无效正则 pattern={pattern!r}：{exc}") from exc
-            item = {"pattern": compiled, "raw": dict(rule)}
+            phrases, indexable = _analyze_pattern(pattern)
+            item = {
+                "pattern": compiled,
+                "raw": dict(rule),
+                "phrases": phrases,
+                "indexable": indexable,
+            }
             (violate if action == "violate" else exempt).append(item)
         self._exempt_rules = exempt
         self._violate_rules = violate
+        self._build_phrase_index(exempt, violate)
 
     def load_from_rows(self, rules: list[dict]) -> None:
         """从数据库 rules 表行加载消歧规则（行含 category / pattern / action / note）。
@@ -518,13 +610,22 @@ class RegexRuleEngine:
         self.load(normalized)
 
     def disambiguate(
-        self, text: str, hits: list[KeywordHitData]
+        self,
+        text: str,
+        hits: list[KeywordHitData],
+        hit_words: Iterable[str] | None = None,
     ) -> tuple[list[KeywordHitData], list[dict]]:
-        """对关键词命中执行正则消歧。
+        """对关键词命中执行正则消歧（索引加速，判定与全量扫描完全一致）。
 
         Args:
             text: 原文。
             hits: 关键词命中列表。
+            hit_words: 调用方提供的原文命中词（如 ``KeywordEngine.scan``
+                返回命中的关键词）。仅作为**加速超集提示**：含于命中词的
+                短语必在原文中（命中词是原文子串），可提前并入扫描子集；
+                **绝不用于排除** —— 排除某条规则的唯一依据是「该规则可
+                索引裁剪且全部短语未在原文出现」，因此传与不传、传多传少
+                都不改变判定结果（正确性优先，索引为加速）。
 
         Returns:
             (保留命中, 被豁免命中列表)；被豁免元素为 ``{"hit": ..., "rule": ...}``
@@ -533,17 +634,24 @@ class RegexRuleEngine:
 
         if not self._exempt_rules and not self._violate_rules:
             return list(hits), []
+        present = self._present_phrases(text, hit_words)
         kept: list[KeywordHitData] = []
         exempted: list[dict] = []
         window = self._context_window
         for hit in hits:
             ctx = text[max(0, hit.start - window) : min(len(text), hit.end + window)]
-            cause = self._match_exempt(ctx, hit.category)
+            cause = self._match_exempt(ctx, hit.category, present)
             if cause is not None:
                 exempted.append({"hit": hit, "rule": cause})
             else:
                 kept.append(hit)
         for rule in self._violate_rules:
+            # 索引加速：可索引裁剪且全部短语未出现在原文 → 该规则必然不命中。
+            # 其余（不可索引 / 短语已出现）与旧行为一致地全量 regex.search。
+            # ``not present`` 短路：原文无任何短语时直接跳过全部可索引规则，
+            # 省去逐条的集合交集（实测为主要加速形态）。
+            if rule["indexable"] and (not present or not (rule["phrases"] & present)):
+                continue
             match = rule["pattern"].search(text)
             if match is not None:
                 kept.append(
@@ -558,10 +666,92 @@ class RegexRuleEngine:
         kept.sort(key=lambda h: (h.start, h.end, h.category, h.keyword))
         return kept, exempted
 
-    def _match_exempt(self, ctx: str, category: str) -> dict | None:
-        """在上下文串中查找第一条类别匹配的 exempt 规则，命中返回原始规则。"""
+    def _present_phrases(self, text: str, hit_words: Iterable[str] | None) -> set[str]:
+        """计算「确凿出现在原文中的索引短语」集合（小写）。
+
+        两个来源，均只会放大扫描子集、不会收窄：
+        - 对原文做短语 AC 扫描 —— 权威来源，保证不遗漏任何出现在原文的短语；
+        - 命中词提示 —— 命中词为原文子串，含于命中词的短语必在原文。
+        """
+
+        present: set[str] = set()
+        automaton = self._phrase_automaton
+        if automaton is None:
+            return present
+        if text:
+            for _end, phrase in automaton.iter(text.lower()):
+                present.add(phrase)
+        if hit_words:
+            for word in hit_words:
+                lowered = (word or "").lower()
+                if not lowered:
+                    continue
+                for _end, phrase in automaton.iter(lowered):
+                    present.add(phrase)
+        return present
+
+    def select_rules_for_phrases(self, phrases: Iterable[str]) -> list[dict]:
+        """按短语集合查询索引命中的规则子集（测试与诊断用）。
+
+        仅返回「至少含其中一个关键短语」的规则内部字典（保持加载顺序）；
+        不含短语的规则（不可能被索引命中）不在返回中 —— 它们由
+        :meth:`disambiguate` 天然回退全量扫描，语义不受影响。
+
+        Args:
+            phrases: 短语集合（大小写不敏感）。
+
+        Returns:
+            命中规则的内部字典列表（含 pattern / raw / phrases / indexable）。
+        """
+
+        selected: list[dict] = []
+        seen: set[int] = set()
+        for phrase in phrases:
+            for rule in self._phrase_index.get(str(phrase).lower(), ()):
+                if id(rule) not in seen:
+                    seen.add(id(rule))
+                    selected.append(rule)
+        return selected
+
+    def _build_phrase_index(self, exempt: list[dict], violate: list[dict]) -> None:
+        """构建「关键短语 → 规则」倒排索引与短语 AC 自动机（加载时一次性完成）。
+
+        ``_phrase_index``：短语(小写) → 规则对象列表；``_phrase_automaton``：
+        全部短语构成的 AC 自动机 —— 用 AC 而非 ``"(?:a|b|…)"`` 组合正则做
+        原文扫描，是为了完整枚举重叠/包含关系的全部短语（组合正则在同位置
+        只报一个可选分支，会漏报「互为前缀」的短语而误裁剪规则）。
+        """
+
+        index: dict[str, list[dict]] = {}
+        for rules in (exempt, violate):
+            for rule in rules:
+                for phrase in rule["phrases"]:
+                    index.setdefault(phrase, []).append(rule)
+        self._phrase_index = index
+        if not index:
+            self._phrase_automaton = None
+            return
+        automaton = ahocorasick.Automaton()
+        for phrase in index:
+            automaton.add_word(phrase, phrase)
+        automaton.make_automaton()
+        self._phrase_automaton = automaton
+
+    def _match_exempt(self, ctx: str, category: str, present: set[str]) -> dict | None:
+        """在上下文串中查找第一条类别匹配的 exempt 规则，命中返回原始规则。
+
+        Args:
+            ctx: 命中片段 + 扩展窗口构成的上下文串。
+            category: 命中类别。
+            present: 出现在原文的索引短语集合（小写）。
+
+        索引裁剪：可索引规则且全部短语未在原文出现时跳过 —— 上下文是原文
+        子串，该规则必然无法命中 ctx，与旧行为（逐条 search）判定等价。
+        """
 
         for rule in self._exempt_rules:
+            if rule["indexable"] and (not present or not (rule["phrases"] & present)):
+                continue
             rule_category = rule["raw"].get("category")
             if rule_category and rule_category != category:
                 continue

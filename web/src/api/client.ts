@@ -9,7 +9,8 @@ import { useToastStore } from '../stores/toast'
  * - baseURL '/admin'：dev 走 vite proxy → :8001，生产同源 mount，全程免 CORS（PRD 决策 H）
  * - 请求拦截器：自动注入 X-Admin-Token（PRD 决策 G）
  * - 响应拦截器：401 → 清 token 并跳转登录页
- * - 导出泛型辅助函数 apiGet/apiPut/apiPost/apiDelete：非 401 错误自动弹 Toast 后继续抛出，
+ * - 导出泛型辅助函数 apiGet/apiPut/apiPost/apiPatch/apiDelete：非 401 错误自动弹
+ *   Toast 后继续抛出，页面可再 catch 做额外处理（如关闭 loading）
  *   页面可再 catch 做额外处理（如关闭 loading）
  */
 export const http = axios.create({
@@ -87,6 +88,10 @@ export function apiPost<T>(url: string, data?: unknown, params?: Record<string, 
 
 export function apiPut<T>(url: string, data?: unknown): Promise<T> {
   return request<T>({ url, method: 'PUT', data })
+}
+
+export function apiPatch<T>(url: string, data?: unknown): Promise<T> {
+  return request<T>({ url, method: 'PATCH', data })
 }
 
 export function apiDelete<T>(url: string, params?: Record<string, unknown>): Promise<T> {

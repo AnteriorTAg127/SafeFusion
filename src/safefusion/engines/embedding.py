@@ -13,6 +13,11 @@
 - 两后端输出一律 L2 归一化，零向量原样返回（保护，不产生 NaN）；
 - 本地后端依赖的 ``torch`` / ``transformers`` 延迟到实例化时才导入，
   缺失时实例化抛 ``RuntimeError`` 并给出安装指引（``uv sync --extra ml``）；
+- v0.3.0 M6 懒加载支持：``LocalChineseCLIP`` 新增 ``cache_dir``（显式 HF 缓存
+  根，缺省交给 transformers 按 ``HF_HOME`` 惯例解析）与 ``local_files_only``
+  （True 时只装载本地缓存、绝不发起网络下载——审核路径自动装配用它避免
+  意外联网，显式下载走 ``engines.model_repo`` 的后台任务）两个建造参数，
+  工厂 :func:`get_embedding_backend` 同步透传；
 - 云端后端使用同步 ``httpx.Client`` 按 OpenAI 风格调用
   ``{base_url}/embeddings``，图像转 base64 data URI；密钥只从环境变量读取
   （``embedding.cloud.api_key_env`` 指定变量名，兜底 ``SAFEFUSION_EMBEDDING_API_KEY``），
@@ -118,11 +123,21 @@ class LocalChineseCLIP(BaseEmbedding):
     ``RuntimeError``（含 ``uv sync --extra ml`` 安装指引）。
     模型支持图文联合编码，故 ``supports_mixed_input=True``，但本类仍按
     契约分别实现 :meth:`encode_texts` / :meth:`encode_images`。
+
+    v0.3.0 M6 懒加载：``cache_dir`` 指定 HF 缓存根（缺省由 transformers 按
+    ``HF_HOME`` 惯例解析）；``local_files_only=True`` 时只装载本地缓存
+    （权重缺失立即抛 ``OSError``，绝不发起网络下载）。
     """
 
     supports_mixed_input = True
 
-    def __init__(self, cfg: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        cfg: dict[str, Any] | None = None,
+        *,
+        cache_dir: str | None = None,
+        local_files_only: bool = False,
+    ) -> None:
         cfg = cfg or {}
         local = _as_dict(cfg.get("local") or {})
         self.model_name: str = str(
@@ -154,6 +169,13 @@ class LocalChineseCLIP(BaseEmbedding):
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
 
+        # v0.3.0 M6：显式缓存根 + 本地只读装载（local_files_only 时不联网）
+        load_kwargs: dict[str, Any] = {}
+        if cache_dir:
+            load_kwargs["cache_dir"] = cache_dir
+        if local_files_only:
+            load_kwargs["local_files_only"] = True
+
         model_id = self.weights_path or self.model_name
         _logger.info("加载 Chinese-CLIP 模型 %s（device=%s）", model_id, device)
         # Chinese-CLIP 的文本编码器是 BERT 结构，CLIPModel 无法装载其权重
@@ -161,16 +183,16 @@ class LocalChineseCLIP(BaseEmbedding):
         # config.model_type 选择专用类 ChineseCLIPModel/ChineseCLIPProcessor，
         # 其余模型回退 CLIP*（主模型修复，2026-08-26，M2 实测捕获）。
         try:
-            model_cfg = AutoConfig.from_pretrained(model_id)
+            model_cfg = AutoConfig.from_pretrained(model_id, **load_kwargs)
             is_chinese_clip = getattr(model_cfg, "model_type", "") == "chinese_clip"
         except Exception:
             is_chinese_clip = "chinese" in model_id.lower() and "clip" in model_id.lower()
         if is_chinese_clip:
-            self._model = ChineseCLIPModel.from_pretrained(model_id)
-            self._processor = ChineseCLIPProcessor.from_pretrained(model_id)
+            self._model = ChineseCLIPModel.from_pretrained(model_id, **load_kwargs)
+            self._processor = ChineseCLIPProcessor.from_pretrained(model_id, **load_kwargs)
         else:
-            self._model = CLIPModel.from_pretrained(model_id)
-            self._processor = CLIPProcessor.from_pretrained(model_id)
+            self._model = CLIPModel.from_pretrained(model_id, **load_kwargs)
+            self._processor = CLIPProcessor.from_pretrained(model_id, **load_kwargs)
         self._model.to(device)
         self._model.eval()
         self._output_dim: int = int(self._model.config.projection_dim)
@@ -308,13 +330,22 @@ class CloudEmbeddingAPI(BaseEmbedding):
         self._client.close()
 
 
-def get_embedding_backend(cfg: dict[str, Any] | Any = None) -> BaseEmbedding:
+def get_embedding_backend(
+    cfg: dict[str, Any] | Any = None,
+    *,
+    cache_dir: str | None = None,
+    local_files_only: bool = False,
+) -> BaseEmbedding:
     """Embedding 后端工厂。
 
     Args:
         cfg: embedding 分组配置（含 ``backend`` / ``local`` / ``cloud`` 键；
             接受 dict 或 T1 的 ``EmbeddingConfig`` pydantic 模型）。``backend``
             取值 ``local``（默认）| ``cloud``。
+        cache_dir: 本地后端的 HF 缓存根目录（缺省由 transformers 按
+            ``HF_HOME`` 惯例解析）。
+        local_files_only: 本地后端只装载本地缓存、不发起网络下载
+            （v0.3.0 M6 懒加载：权重缺失立即抛异常而非联网下载）。
 
     Returns:
         对应后端实例。local 后端在缺失 torch/transformers 时实例化抛
@@ -326,7 +357,11 @@ def get_embedding_backend(cfg: dict[str, Any] | Any = None) -> BaseEmbedding:
     cfg_dict = _as_dict(cfg)
     backend = cfg_dict.get("backend", "local")
     if backend == "local":
-        return LocalChineseCLIP(cfg_dict)
+        return LocalChineseCLIP(
+            cfg_dict,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
     if backend == "cloud":
         return CloudEmbeddingAPI(cfg_dict)
     raise ValueError(f"未知 Embedding 后端: {backend!r}（可选 local/cloud）")

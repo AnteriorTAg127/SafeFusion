@@ -7,6 +7,14 @@
  * - 添加：词 + 分类 + 池（禁用，后端无池维度）→ 走导入端点（单条 TXT）
  * - 导入：CSV（类别,词 两列）/ TXT（每行一词 + 分类）文件上传
  * - 分页（客户端内存分页）+ 空态 + loading
+ * - T41「🧹 一键去重」：列表卡顶部按钮 → ConfirmDialog 说明副作用（自动备份 zip
+ *   到 data/backups/、去重后引擎重载、不可撤销）→ POST /admin/keywords/dedup →
+ *   成功 Toast + AppModal 结果摘要（前后条数 / 无法去重数 / 备份文件名 / 引擎重载）。
+ *   ⚠️ 后端尚无 dedup 端点（admin.py 全文核对：仅 import/list/delete 三端点，
+ *   PRD §M9 G10 由主模型集成阶段补后端）→ 前端按如下契约先写好调用：
+ *   POST /admin/keywords/dedup → { status, before, after, removed, failed,
+ *   backup_file, reload }；未就绪时该请求会 404/405 并由 api 层 Toast 报错，
+ *   不阻塞其它功能（见报告 TODO）。
  *
  * 字段对齐（依据 src/safefusion/api/admin.py、storage/database.py keywords 表）：
  *   GET /admin/keywords?category&page&page_size → { total, page, page_size,
@@ -26,7 +34,9 @@
 import { onMounted, ref } from 'vue'
 import StatCard from '../components/StatCard.vue'
 import DataTable from '../components/DataTable.vue'
+import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
+import AppModal from '../components/AppModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { apiGet, apiPost, apiDelete } from '../api/client'
 import { useToastStore } from '../stores/toast'
@@ -63,6 +73,64 @@ const loading = ref(false)
 const deleting = ref<KeywordRow | null>(null)
 const submitting = ref(false)
 
+// ---------- T41：一键去重 ----------
+/**
+ * POST /admin/keywords/dedup 期望响应契约（后端由主模型集成阶段补，见文件头注释）：
+ * { status: "ok", before, after, removed, failed, backup_file, reload }
+ * 字段缺失时前端以「—」展示，绝不臆造数值。
+ */
+interface DedupResult {
+  status?: string
+  before?: number
+  after?: number
+  removed?: number
+  failed?: number
+  backup_file?: string | null
+  reload?: string
+  [key: string]: unknown
+}
+
+/** 去重前的词条总数（恢复用；请求失败不更新） */
+const dedupBeforeCount = ref(0)
+const dedupAskOpen = ref(false) // 副作用确认弹窗
+const dedupRunning = ref(false) // 请求进行中
+const dedupResult = ref<DedupResult | null>(null) // 结果摘要弹窗数据
+
+/** 「🧹 一键去重」：先确认副作用，再提交 */
+function askDedup(): void {
+  dedupBeforeCount.value = totalCount.value
+  dedupAskOpen.value = true
+}
+
+async function confirmDedup(): Promise<void> {
+  dedupAskOpen.value = false
+  dedupRunning.value = true
+  try {
+    const res = await apiPost<DedupResult>('/keywords/dedup')
+    dedupResult.value = res
+    toast.success(res.status === 'ok' ? '去重完成（词库已更新）' : '去重返回（请查看结果摘要）')
+    await loadData() // 去重后刷新列表/统计
+  } catch (error) {
+    // 后端未就绪时 404/405 已由 api 层 Toast（TODO：主模型补 POST /admin/keywords/dedup）
+    console.warn('[KeywordsView] 词库去重失败：', error)
+  } finally {
+    dedupRunning.value = false
+  }
+}
+
+/** 引擎重载状态码 → 中文（未知值回显原文） */
+function reloadText(value: unknown): string {
+  if (value === 'ok') return '✅ 已重载'
+  if (value === 'skipped') return '⏭ 跳过（未注入重载钩子）'
+  if (value === 'failed') return '❌ 重载失败'
+  return value === null || value === undefined ? '—' : String(value)
+}
+
+/** 数值结果展示（未知字段回退「—」） */
+function dedupNum(value: unknown): string {
+  return typeof value === 'number' ? value.toLocaleString() : '—'
+}
+
 // ---------- 统计 ----------
 const totalCount = ref(0)
 const categoryCount = ref(0)
@@ -77,6 +145,12 @@ const categories = ref<string[]>([])
 // ---------- 添加 / 导入表单 ----------
 const addWord = ref('')
 const addCategory = ref('')
+/** 添加/导入面板引用：空态「去添加词条」滚动到此处（PRD §M1 空态即下一步） */
+const addPanelRef = ref<HTMLElement | null>(null)
+
+function scrollToAddPanel(): void {
+  addPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 function textOf(value: unknown): string {
   return value === null || value === undefined ? '' : String(value)
@@ -243,6 +317,10 @@ const columns = [
 <template>
   <section class="page-view">
     <h2 class="page-title">📚 词库管理</h2>
+    <p class="page-hint">
+      维护关键词词条：导入 CSV/TXT、单条添加、删除；词条进库后关键词层（Aho-Corasick + 拼音变体）
+      实时生效。主操作 = 下方「➕ 添加 / 导入词条」面板。
+    </p>
 
     <!-- 顶部统计条 -->
     <div class="stats-grid">
@@ -281,7 +359,7 @@ const columns = [
     </div>
 
     <!-- 添加 / 导入 -->
-    <div class="card">
+    <div ref="addPanelRef" class="card">
       <div class="card-title"><span>➕ 添加 / 导入词条</span></div>
       <div class="add-row">
         <input v-model="addWord" type="text" class="input add-word" placeholder="词（单条添加）" />
@@ -299,17 +377,63 @@ const columns = [
           📥 导入 CSV/TXT
         </button>
       </div>
+
+      <!-- 支持格式示例块（PRD v0.3.0 §M1；文案依据 admin.py _parse_keywords_csv/_parse_keywords_txt 实际解析能力） -->
+      <div class="fmt-block">
+        <div class="fmt-title">📋 支持格式（示例）</div>
+        <ul class="fmt-list">
+          <li>
+            <b>CSV</b>：固定两列「类别,词」（第 1 列类别、第 2 列词，列序不可调换）；首行恰为
+            <code>类别,词</code> 时作为表头自动跳过。
+            <pre class="fmt-code">类别,词
+政治,敏感词
+色情,another keyword</pre>
+          </li>
+          <li>
+            <b>TXT</b>：每行一个词（自动跳过 <code>#</code> 注释行与空行），整批归入上方「分类」
+            输入框填写的类别（TXT 导入前分类必填）。
+            <pre class="fmt-code"># 敏感词库
+赌博
+刷单</pre>
+          </li>
+          <li>
+            <b>编码</b>：仅支持 <b>UTF-8</b>（可带 BOM）；GBK 等其它编码会提示「文件编码不支持」，
+            请先转存为 UTF-8 再导入。
+          </li>
+          <li>重复词条（分类 + 词唯一）自动跳过并计数，不覆盖已有数据；单条「添加」= 以 TXT 形态提交一个词。</li>
+        </ul>
+      </div>
+
       <p class="filter-note">
-        添加为单条 TXT 编码走 /admin/keywords/import（后端无单条 POST 端点，TODO）；
-        CSV 格式「类别,词」两列（首行表头可带）；TXT 每行一词挂到上方分类；
-        重复词条（category+word 唯一）自动跳过不覆盖。
+        说明：添加为单条 TXT 编码走 /admin/keywords/import（后端无单条 POST 端点，TODO）；
+        CSV 表头仅识别「类别,词」（英文表头不会跳过，会被当词条导入）；重复自动跳过。
       </p>
     </div>
 
     <!-- 词条表格 -->
     <div class="card">
-      <div class="card-title"><span>🗃️ 词条列表（共 {{ total }} 条）</span></div>
-      <DataTable :columns="columns" :rows="rows" :loading="loading" empty-text="暂无词条">
+      <div class="card-title">
+        <span>🗃️ 词条列表（共 {{ total }} 条）</span>
+        <button
+          type="button"
+          class="btn btn-danger btn-sm"
+          :disabled="dedupRunning || loading"
+          :title="'去重前自动备份 zip 到 data/backups/；去重后词库引擎自动重载（后端端点由主模型集成阶段补，未就绪时会报错）'"
+          @click="askDedup"
+        >
+          {{ dedupRunning ? '去重中…' : '🧹 一键去重' }}
+        </button>
+      </div>
+      <DataTable :columns="columns" :rows="rows" :loading="loading">
+        <template #empty>
+          <EmptyState
+            icon="📚"
+            title="词库空空如也"
+            :hint="'关键词层目前没有任何词可匹配，审核请求将完全不经过关键词通道。\n在上方「添加 / 导入词条」面板导入 CSV/TXT 或逐条添加即可开始生效；分类的黑白池维度后端暂未提供（TODO）。'"
+            action-text="去添加词条"
+            @action="scrollToAddPanel"
+          />
+        </template>
         <template #cell="{ row, column }">
           <template v-if="column.key === 'word'">{{ textOf(row.word) }}</template>
           <template v-else-if="column.key === 'pool'">
@@ -337,12 +461,99 @@ const columns = [
       @confirm="confirmDelete"
       @cancel="deleting = null"
     />
+
+    <!-- T41：一键去重副作用确认（PRD §M9 G10 + D3 借鉴：危险操作前置说明） -->
+    <ConfirmDialog
+      :show="dedupAskOpen"
+      title="🧹 一键去重词库"
+      :message="`去重将执行以下操作（不可撤销）：① 自动备份当前词库（${dedupBeforeCount.toLocaleString()} 条）为 zip 存至 data/backups/；② 剥离符号/前缀等变体后按「类别+词」去重；③ 去重完成后词库引擎自动重载（无需重启服务）。继续吗？`"
+      danger
+      @confirm="confirmDedup"
+      @cancel="dedupAskOpen = false"
+    />
+
+    <!-- T41：去重结果摘要（字段以后端实际响应为准，缺失显示 —） -->
+    <AppModal :show="dedupResult !== null" title="🧹 去重结果" @close="dedupResult = null">
+      <table class="result-table">
+        <tbody>
+          <tr><td>去重前条数</td><td>{{ dedupNum(dedupResult?.before) }}</td></tr>
+          <tr><td>去重后条数</td><td>{{ dedupNum(dedupResult?.after) }}</td></tr>
+          <tr><td>移除条数</td><td>{{ dedupNum(dedupResult?.removed) }}</td></tr>
+          <tr><td>无法去重数</td><td>{{ dedupNum(dedupResult?.failed) }}</td></tr>
+          <tr>
+            <td>备份文件</td>
+            <td class="mono-cell">{{ typeof dedupResult?.backup_file === 'string' && dedupResult.backup_file ? dedupResult.backup_file : '—' }}</td>
+          </tr>
+          <tr><td>引擎重载</td><td>{{ reloadText(dedupResult?.reload) }}</td></tr>
+        </tbody>
+      </table>
+      <p class="result-note">
+        备份位于服务端 data/backups/ 目录（与旧版 node 前端「自动备份 zip + 结果摘要」行为对齐，
+        G10）；若需恢复请从备份文件重新导入。
+      </p>
+      <template #actions>
+        <button type="button" class="btn btn-primary" @click="dedupResult = null">关闭</button>
+      </template>
+    </AppModal>
   </section>
 </template>
 
 <style scoped>
+/* 标题下操作提示行（PRD v0.3.0 §M1：每页用途 + 主操作） */
+.page-hint {
+  font-size: 0.76rem;
+  color: var(--text-3);
+  line-height: 1.7;
+  margin: -8px 0 14px;
+}
+
 .filter-card {
   margin-bottom: 16px;
+}
+
+/* 导入示例块（PRD §M1：每行一条 + 示例块 + 列名说明 + 编码提示） */
+.fmt-block {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--surface-hover);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.fmt-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+
+.fmt-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 0.74rem;
+  color: var(--text-2);
+  line-height: 1.8;
+}
+
+.fmt-list code {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 0.7rem;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+.fmt-code {
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 }
 
 .filter-row {
@@ -414,5 +625,38 @@ const columns = [
 .tag-blue {
   background: var(--primary-light);
   color: var(--primary);
+}
+
+/* T41：去重结果摘要表 */
+.result-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.result-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.result-table td:first-child {
+  color: var(--text-3);
+  font-weight: 600;
+  width: 110px;
+  white-space: nowrap;
+}
+
+.mono-cell {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.76rem;
+  word-break: break-all;
+}
+
+.result-note {
+  margin-top: 10px;
+  font-size: 0.74rem;
+  color: var(--text-3);
+  line-height: 1.6;
 }
 </style>

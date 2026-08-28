@@ -3,7 +3,9 @@
  * 通用数据表格：列定义 + 行数据 + loading + 空态。
  * - 单元格默认按列 key 取值渲染（Vue 插值自动转义，防 XSS）；
  * - 对象/数组值自动 JSON 序列化展示；
- * - 提供 cell 具名插槽（作用域：row / column / value）供自定义渲染（按钮、徽标等）。
+ * - 提供 cell 具名插槽（作用域：row / column / value）供自定义渲染（按钮、徽标等）；
+ * - 提供 empty 具名插槽供页面接入 EmptyState 组件（「为什么空 + 下一步」），
+ *   未提供时回退为默认图标 + emptyText 文案（旧调用点完全兼容，无需改动）。
  */
 
 /** 列定义（由父组件以结构类型传入，无需显式导入） */
@@ -55,10 +57,12 @@ function columnStyle(column: ColumnDef): Record<string, string | number> | undef
     <div v-if="props.loading" class="loading-row">
       <div class="loading">加载中...</div>
     </div>
-    <!-- 空态 -->
+    <!-- 空态（支持 empty 具名插槽接入 EmptyState；缺省回退图标+文案） -->
     <div v-else-if="props.rows.length === 0" class="empty-state">
-      <span class="empty-icon">📭</span>
-      <p>{{ props.emptyText }}</p>
+      <slot name="empty">
+        <span class="empty-icon">📭</span>
+        <p>{{ props.emptyText }}</p>
+      </slot>
     </div>
     <!-- 数据表格 -->
     <table v-else class="table">

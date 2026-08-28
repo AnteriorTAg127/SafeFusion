@@ -1,17 +1,22 @@
-"""管理 API 配置端点与配置覆盖层测试（PRD v0.2.1 M2 / T22 任务卡）。
+"""管理 API 配置端点测试（PRD v0.2.1 M2 + v0.3.0 M4 / T30A 迁移更新）。
 
 覆盖：
 - **Key 遮蔽**（决策 F）：GET/PUT /admin/config 中 ``api_key`` 一律替换为
   ``{"api_key_env", "configured"}``，响应体绝不含真实密钥值；
-- **合并优先级**（决策 D）：内置默认 < config.yaml < 覆盖层 < 环境变量，
-  环境变量最高优先、不反向写回；（覆盖层文件原子读写 / 损坏容错 / 分组删除）；
-- **PUT 校验**：未知分组 / 非法 backend / 必填缺失 / 数值越界 / ``api_key``
-  写入被拒 / ``fuse_mode`` 维度一致性（backend=cloud 且 weighted_avg|pool
-  → 422 建议 concat）均返回 422 中文可读错误；空对象 ``{}`` 删除覆盖层分组；
+- **优先级**（决策 B，v0.3.0 起存储为 SQLite settings 表）：内置默认 <
+  config.yaml < DB settings < 环境变量，环境变量最高优先、不反向写回、
+  **env 绝不写 DB**；（settings DAO / 损坏行容错 / 分组删除）；
+- **PUT**（v0.3.0 起写 DB + 全量热应用，不再「重启生效」）：未知分组 /
+  非法 backend / 必填缺失 / 数值越界 / ``api_key`` 写入被拒 / ``fuse_mode``
+  维度一致性均返回 422 中文可读错误；空对象 ``{}`` 删除 DB 分组并热回退；
+  成功响应含 ``applied`` / ``apply_scope`` / 字段级 ``sources``；
 - **静态托管**：``web/dist`` 不存在时无影响；存在时 mount 成功且 /admin/* 路由
   不被 ``/`` 静态目录吞掉（Starlette 按注册顺序匹配）。
 
-沿用 tests/test_api_admin.py 风格：TestClient + tmp_path 真实 SQLite + 鸭子配置。
+迁移说明（T30A）：v0.2.1 的覆盖层文件接口（``save_overrides`` /
+``load_overrides`` 等）已由 settings 表 DAO 取代；相关断言改为
+``Database.set_settings / list_settings / delete_settings``。``restart_required``
+字段替换为 ``applied``（热应用即时生效）。
 """
 
 from __future__ import annotations
@@ -30,8 +35,12 @@ from starlette.routing import Mount
 from safefusion.api.admin import create_admin_app
 from safefusion.config import load_config
 from safefusion.core import config_override as co
+from safefusion.core import hot_apply
+from safefusion.core.context import AppContext
 from safefusion.engines.image_pipeline import WhitelistMatcher
 from safefusion.storage.database import Database
+
+from .fakes import FakeEmbedding
 
 api_main = importlib.import_module("safefusion.api.__main__")
 
@@ -56,10 +65,23 @@ def _put(client: TestClient, group: str, payload: dict) -> Any:
     return client.put(f"/admin/config/{group}", json=payload, headers=_headers())
 
 
+def _cloud_cfg(tmp_path: Path) -> Any:
+    """容器配置：data_dir=tmp + embedding backend=cloud（免触发真实 CLIP 加载）。"""
+
+    from .conftest import build_config
+
+    return build_config(tmp_path, embedding={"backend": "cloud"})
+
+
 def _make_client(tmp_path: Path) -> TestClient:
     db = Database(tmp_path / "audit.db")
-    matcher = WhitelistMatcher(db)
-    app = create_admin_app(db, matcher, config=_DuckCfg(tmp_path, TOKEN))
+    container = AppContext.build(_cloud_cfg(tmp_path), database=db)
+    app = create_admin_app(
+        db,
+        WhitelistMatcher(db),
+        config=_DuckCfg(tmp_path, TOKEN),
+        container=container,
+    )
     client = TestClient(app)
     return client
 
@@ -94,7 +116,7 @@ class TestGetConfigMasking:
         # embedding 按 {backend, local, cloud} 结构对齐 config.py
         assert body["embedding"]["backend"] == "local"
         assert set(body["embedding"].keys()) == {"backend", "local", "cloud"}
-        # 语义组虚拟键 fuse_mode 默认 pool（对齐 SemanticEngine 阈值默认）
+        # 语义组 fuse_mode 默认 pool（v0.3.0 起为真实叶子，默认值一致）
         assert body["semantic"]["fuse_mode"] == "pool"
 
     def test_llm_key_masked_env_set(self, admin_client, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,87 +158,103 @@ class TestGetConfigMasking:
 
 
 class TestOverrideMerge:
-    """覆盖层合并优先级（决策 D）：默认 < YAML < 覆盖层 < 环境变量。"""
+    """settings 合并优先级（决策 B）：默认 < YAML < DB settings < 环境变量。"""
 
-    def test_defaults_when_no_override(self, tmp_path: Path) -> None:
-        eff = co.effective_config(load_config(None), tmp_path)
+    def test_defaults_when_no_settings(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        eff = co.effective_config(load_config(None), db)
         assert eff.thresholds.semantic_threshold == 0.67
+        db.close()
 
-    def test_override_beats_default(self, tmp_path: Path) -> None:
-        co.save_overrides(tmp_path, "thresholds", {"semantic_threshold": 0.5})
-        eff = co.effective_config(load_config(None), tmp_path)
+    def test_db_beats_default(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("thresholds", {"semantic_threshold": 0.5})
+        eff = co.effective_config(load_config(None), db)
         assert eff.thresholds.semantic_threshold == 0.5
         assert eff.thresholds.margin_w == 0.05  # 未覆盖键仍取默认
+        db.close()
 
-    def test_env_beats_override_not_reverse_written(
+    def test_env_beats_db_not_reverse_written(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        co.save_overrides(tmp_path, "thresholds", {"semantic_threshold": 0.5})
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("thresholds", {"semantic_threshold": 0.5})
         monkeypatch.setenv("SAFEFUSION_THRESHOLDS_SEMANTIC_THRESHOLD", "0.9")
-        eff = co.effective_config(load_config(None), tmp_path)
+        eff = co.effective_config(load_config(None), db)
         assert eff.thresholds.semantic_threshold == 0.9
-        # 不反向写回：覆盖层文件保持原值，环境变量只覆盖运行值
-        raw = json.loads((tmp_path / "config_overrides.json").read_text(encoding="utf-8"))
-        assert raw["thresholds"]["semantic_threshold"] == 0.5
+        # 不反向写回：DB settings 行保持原值，环境变量只覆盖运行值
+        assert json.loads(db.get_setting("thresholds", "semantic_threshold")["value_json"]) == 0.5
+        db.close()
 
-    def test_yaml_below_override(self, tmp_path: Path) -> None:
+    def test_yaml_below_db(self, tmp_path: Path) -> None:
         yaml_text = "thresholds:\n  semantic_threshold: 0.55\n"
         (tmp_path / "cfg.yaml").write_text(yaml_text, encoding="utf-8")
-        co.save_overrides(tmp_path, "thresholds", {"semantic_threshold": 0.5})
-        eff = co.effective_config(load_config(str(tmp_path / "cfg.yaml")), tmp_path)
-        assert eff.thresholds.semantic_threshold == 0.5  # 覆盖层 > YAML
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("thresholds", {"semantic_threshold": 0.5})
+        eff = co.effective_config(load_config(str(tmp_path / "cfg.yaml")), db)
+        assert eff.thresholds.semantic_threshold == 0.5  # DB > YAML
+        db.close()
 
-    def test_partial_override_keeps_others(self, tmp_path: Path) -> None:
-        co.save_overrides(tmp_path, "llm", {"model": "gpt-test"})
-        eff = co.effective_config(load_config(None), tmp_path)
+    def test_partial_db_keeps_others(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("llm", {"model": "gpt-test"})
+        eff = co.effective_config(load_config(None), db)
         assert eff.llm.model == "gpt-test"
         assert eff.llm.base_url == "https://api.openai.com/v1"  # 未覆盖键沿用默认
+        db.close()
 
     def test_unknown_group_dropped_with_warning(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        co.save_overrides(tmp_path, "bogus_group", {"x": 1})
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("bogus_group", {"x": 1})
         with caplog.at_level(logging.WARNING, logger="safefusion.config_override"):
-            eff = co.effective_config(load_config(None), tmp_path)
+            eff = co.effective_config(load_config(None), db)
         assert "未知分组" in caplog.text
         assert eff.thresholds.semantic_threshold == 0.67  # 其余分组不受影响
+        db.close()
 
-    def test_corrupt_file_tolerated(self, tmp_path: Path) -> None:
+    def test_corrupt_legacy_file_migrates_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # 旧覆盖层损坏 → 迁移容错：归档、settings 空、有效配置保持默认
         (tmp_path / "config_overrides.json").write_text("{broken", encoding="utf-8")
-        assert co.load_overrides(tmp_path) == {}
-        eff = co.effective_config(load_config(None), tmp_path)
+        db = Database(tmp_path / "audit.db")
+        with caplog.at_level(logging.WARNING, logger="safefusion.config_override"):
+            assert co.migrate_overrides_file(tmp_path, db) is True
+        assert db.list_settings() == []
+        eff = co.effective_config(load_config(None), db)
         assert eff.thresholds.semantic_threshold == 0.67
+        db.close()
 
     def test_merge_strips_hand_edited_secret(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # 红线防御：手工编辑的覆盖层若携带 api_key，加载合并时剥离并告警
-        (tmp_path / "config_overrides.json").write_text(
-            json.dumps({"llm": {"api_key": "hand-secret", "model": "gpt-x"}}),
-            encoding="utf-8",
-        )
+        # 红线防御：手工写入 DB 的 api_key 行，加载合并时剥离并告警
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("llm", {"api_key": "hand-secret", "model": "gpt-x"})
         with caplog.at_level(logging.WARNING, logger="safefusion.config_override"):
-            eff = co.effective_config(load_config(None), tmp_path)
+            eff = co.effective_config(load_config(None), db)
         assert "api_key" in caplog.text
         assert eff.llm.model == "gpt-x"  # 非密钥键仍生效
         assert eff.llm.api_key is None  # 密钥值未进入配置模型
+        db.close()
 
-    def test_save_update_delete_single_group(self, tmp_path: Path) -> None:
-        path = co.save_overrides(tmp_path, "server", {"port": 9999})
-        assert path == tmp_path / "config_overrides.json"
-        merged = co.update_overrides(tmp_path, "server", {"admin_port": 9001})
-        assert merged == {"port": 9999, "admin_port": 9001}
-        assert co.delete_group_overrides(tmp_path, "server") is True
-        assert co.load_overrides(tmp_path) == {}
-        assert not path.exists()  # 无剩余分组时移除空壳文件
-        assert co.delete_group_overrides(tmp_path, "server") is False
-        assert list(tmp_path.glob("*.tmp")) == []  # 原子写不残留临时文件
+    def test_set_list_delete_single_group(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        db.set_settings("server", {"port": 9999, "admin_port": 9001})
+        assert json.loads(db.get_setting("server", "admin_port")["value_json"]) == 9001
+        assert db.delete_settings("server") is True
+        assert db.list_settings("server") == []
+        assert db.delete_settings("server") is False
+        assert db.list_settings() == []
+        db.close()
 
 
 class TestPutConfig:
-    """PUT /admin/config/{group}：校验、落盘、恢复默认、Key 遮蔽。"""
+    """PUT /admin/config/{group}：校验、落库 + 热应用、恢复默认、Key 遮蔽。"""
 
-    def test_put_valid_thresholds_writes_override(self, admin_client, tmp_path: Path) -> None:
+    def test_put_valid_thresholds_applies(self, admin_client, tmp_path: Path) -> None:
         resp = admin_client.put(
             "/admin/config/thresholds",
             json={"semantic_threshold": 0.5, "margin_w": 0.1},
@@ -225,11 +263,15 @@ class TestPutConfig:
         assert resp.status_code == 200
         body = resp.json()
         assert body["saved"] is True
-        assert body["restart_required"] is True
+        assert body["applied"] is True  # 热应用：不再「重启生效」
+        assert body["apply_scope"] == "runtime"
         assert body["group"] == "thresholds"
         assert body["config"]["semantic_threshold"] == 0.5
-        raw = json.loads((tmp_path / "config_overrides.json").read_text(encoding="utf-8"))
-        assert raw["thresholds"] == {"semantic_threshold": 0.5, "margin_w": 0.1}
+        assert body["sources"]["semantic_threshold"] == "db"
+        db = Database(tmp_path / "audit.db")
+        rows = {r["key"]: json.loads(r["value_json"]) for r in db.list_settings("thresholds")}
+        assert rows == {"semantic_threshold": 0.5, "margin_w": 0.1}
+        db.close()
         got = admin_client.get("/admin/config", headers=_headers()).json()
         assert got["thresholds"]["semantic_threshold"] == 0.5
 
@@ -287,7 +329,11 @@ class TestPutConfig:
         assert resp.status_code == 422
         assert "concat" in resp.json()["error"]  # 可读提示建议改用 concat
 
-    def test_put_fuse_mode_concat_then_cloud_ok(self, admin_client) -> None:
+    def test_put_fuse_mode_concat_then_cloud_ok(
+        self, admin_client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # v0.3.0：重建类先「试建造」（注入可用假后端）通过后才落库热应用
+        monkeypatch.setattr(hot_apply, "build_embedding", lambda _cfg: FakeEmbedding(texts={}))
         first = admin_client.put(
             "/admin/config/semantic", json={"fuse_mode": "concat"}, headers=_headers()
         )
@@ -309,9 +355,11 @@ class TestPutConfig:
         assert "concat" in resp.json()["error"]
 
     def test_put_semantic_weighted_avg_with_cloud_backend_422(
-        self, admin_client, tmp_path: Path
+        self, admin_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 先落盘：语义 fuse_mode=concat + embedding backend=cloud（绕过组合校验直写）
+        # 再造类试建造注入可用假后端（真实云端需 Key，测试环境必然 500）
+        monkeypatch.setattr(hot_apply, "build_embedding", lambda _cfg: FakeEmbedding(texts={}))
+        # 先落库：语义 fuse_mode=concat + embedding backend=cloud（绕过组合校验直写）
         assert (
             admin_client.put(
                 "/admin/config/semantic", json={"fuse_mode": "concat"}, headers=_headers()
@@ -331,9 +379,10 @@ class TestPutConfig:
         )
         assert resp.status_code == 422
         assert "改用 concat" in resp.json()["error"]
-        # 校验失败不落盘
-        raw = json.loads((tmp_path / "config_overrides.json").read_text(encoding="utf-8"))
-        assert raw["semantic"]["fuse_mode"] == "concat"
+        # 校验失败不落库（DB settings 保持 concat）
+        db = Database(tmp_path / "audit.db")
+        assert json.loads(db.get_setting("semantic", "fuse_mode")["value_json"]) == "concat"
+        db.close()
 
     def test_put_api_key_rejected_422(self, admin_client, tmp_path: Path) -> None:
         resp = _put(admin_client, "llm", {"api_key": "sk-huge-secret"})
@@ -345,16 +394,22 @@ class TestPutConfig:
             "/admin/config/llm", json={"api_key_env": "MY_CUSTOM_KEY"}, headers=_headers()
         )
         assert ok.status_code == 200
+        # 密钥值绝不落库
+        db = Database(tmp_path / "audit.db")
+        assert db.get_setting("llm", "api_key") is None
+        db.close()
 
     def test_put_empty_body_resets_group(self, admin_client, tmp_path: Path) -> None:
         _put(admin_client, "thresholds", {"semantic_threshold": 0.5})
         resp = _put(admin_client, "thresholds", {})
         assert resp.status_code == 200
-        assert resp.json()["deleted_override"] is True
-        assert resp.json()["config"]["semantic_threshold"] == 0.67  # 恢复默认
-        # 删除后无剩余分组：覆盖层文件整体移除（不留空壳）
-        assert co.load_overrides(tmp_path) == {}
-        assert not (tmp_path / "config_overrides.json").exists()
+        assert resp.json()["deleted_db_group"] is True
+        assert resp.json()["config"]["semantic_threshold"] == 0.67  # 恢复默认并热应用
+        assert resp.json()["sources"]["semantic_threshold"] == "default"
+        # 删除后该组 settings 行清空
+        db = Database(tmp_path / "audit.db")
+        assert db.list_settings("thresholds") == []
+        db.close()
 
     def test_put_required_field_not_empty(self, admin_client) -> None:
         resp = admin_client.put("/admin/config/llm", json={"model": ""}, headers=_headers())

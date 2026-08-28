@@ -4,6 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SafeFusion 管理面板</title>
+    <script>
+      // T35 防闪烁：在首帧渲染前按 localStorage sf_theme / 系统偏好解析实际主题并
+      // 写入 <html data-theme>，避免深色用户先看到浅色背景再切换（白闪）。
+      // 逻辑与 src/stores/theme.ts 保持一致（内联副本，不依赖模块加载时序）。
+      (function () {
+        try {
+          var t = localStorage.getItem('sf_theme');
+          var dark =
+            t === 'dark' ||
+            (t !== 'light' &&
+              typeof window.matchMedia === 'function' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'light');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

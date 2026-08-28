@@ -23,10 +23,11 @@
  */
 import { onMounted, ref } from 'vue'
 import DataTable from '../components/DataTable.vue'
+import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 import AppModal from '../components/AppModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
-import { apiGet, apiPost, apiPut, apiDelete } from '../api/client'
+import { apiGet, apiPost, apiPatch, apiDelete } from '../api/client'
 import { useToastStore } from '../stores/toast'
 
 interface RulesResponse {
@@ -149,7 +150,7 @@ function onPageChange(nextPage: number): void {
 async function toggleActive(row: RuleRow): Promise<void> {
   const target = !isActive(row)
   try {
-    const res = await apiPut<{ id: number; active: boolean }>(`/rules/${String(row.id)}/active`, {
+    const res = await apiPatch<{ id: number; active: boolean }>(`/rules/${String(row.id)}/active`, {
       active: target,
     })
     row['is_active'] = res.active
@@ -282,6 +283,10 @@ const columns = [
 <template>
   <section class="page-view">
     <h2 class="page-title">📏 规则管理</h2>
+    <p class="page-hint">
+      用正则消歧关键词命中：exempt 豁免命中（放行）、violate 追加强命中（违规）。右上角「➕ 新增规则」
+      手写一条，或「📥 导入 CSV/JSON」批量建立；规则变更后热重载即时生效。
+    </p>
 
     <!-- 筛选栏 + 操作入口 -->
     <div class="card filter-card">
@@ -315,12 +320,46 @@ const columns = [
         经 POST /admin/rules（JSON 数组）；导入支持 CSV（category,pattern,action
         三列）或 JSON 数组文件；action 缺省为 exempt。
       </p>
+
+      <!-- 支持格式示例块（PRD v0.3.0 §M1；文案依据 admin.py _parse_rules_csv 与实际端点行为） -->
+      <div class="fmt-block">
+        <div class="fmt-title">📋 支持格式（示例）</div>
+        <ul class="fmt-list">
+          <li>
+            <b>CSV</b>：固定三列「category,pattern,action」（列序固定；action 可省略、缺省为
+            <code>exempt</code>；类别留空 = 不限类别）。表头行（<code>category,pattern</code> /
+            <code>类别,规则</code> / <code>类别,pattern</code>）自动跳过。
+            <pre class="fmt-code">category,pattern,action
+色情,测试\d{6},violate
+,官方声明,exempt</pre>
+          </li>
+          <li>
+            <b>JSON</b>：规则对象数组 <code>[{category, pattern, action, note}]</code>。
+            <pre class="fmt-code">[{"category":"赌博","pattern":"博彩\d+","action":"violate","note":"示例"}]</pre>
+          </li>
+          <li>
+            <b>编码</b>：仅支持 <b>UTF-8</b>（可带 BOM）；GBK 等其它编码会提示「文件编码不支持」，
+            请先转存为 UTF-8 再导入。
+          </li>
+          <li>校验：pattern 必须是有效正则、action 仅 <code>exempt</code>/<code>violate</code>，否则整批 400 拒绝；
+            重复规则（类别 + 正则 + 动作）自动跳过并计数；导入成功后规则层热重载即时生效。</li>
+        </ul>
+      </div>
     </div>
 
     <!-- 规则表格 -->
     <div class="card">
       <div class="card-title"><span>🗃️ 正则规则（共 {{ total }} 条）</span></div>
-      <DataTable :columns="columns" :rows="rows" :loading="loading" empty-text="暂无规则">
+      <DataTable :columns="columns" :rows="rows" :loading="loading">
+        <template #empty>
+          <EmptyState
+            icon="📏"
+            title="暂无正则规则"
+            :hint="'正则消歧规则用于修正关键词命中：exempt 豁免命中、violate 追加强命中。\n点击右上角「➕ 新增规则」手写一条（pattern + 类别 + action），或「📥 导入 CSV/JSON」批量建立；规则为空时规则层直接跳过，不影响关键词与语义判定。'"
+            action-text="新增规则"
+            @action="openForm"
+          />
+        </template>
         <template #cell="{ row, column }">
           <template v-if="column.key === 'pattern'">
             <span class="pattern-cell" :title="textOf(row.pattern)">{{ textOf(row.pattern) }}</span>
@@ -398,8 +437,61 @@ const columns = [
 </template>
 
 <style scoped>
+/* 标题下操作提示行（PRD v0.3.0 §M1：每页用途 + 主操作） */
+.page-hint {
+  font-size: 0.76rem;
+  color: var(--text-3);
+  line-height: 1.7;
+  margin: -8px 0 14px;
+}
+
 .filter-card {
   margin-bottom: 16px;
+}
+
+/* 导入示例块（PRD §M1：每行一条 + 示例块 + 列名说明 + 编码提示） */
+.fmt-block {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--surface-hover);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.fmt-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+
+.fmt-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 0.74rem;
+  color: var(--text-2);
+  line-height: 1.8;
+}
+
+.fmt-list code {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 0.7rem;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+.fmt-code {
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 }
 
 .filter-row {
