@@ -46,6 +46,10 @@ class ThresholdsConfig(_BaseConfig):
 
     semantic_threshold: float = Field(default=0.67, description="语义层判定违规的相似度阈值")
     margin_w: float = Field(default=0.05, description="黑均分−白均分差值与 margin 的比较基准")
+    black_white_gap: float = Field(
+        default=0.02,
+        description="黑顶分−白顶分最小差距：单条黑相似度再高，与白顶分差距不足此值不判违规（防单条巧合误判）",
+    )
     confidence_low: float = Field(default=0.35, description="置信度低档上界，低于则判定安全")
     confidence_high: float = Field(default=0.75, description="置信度高档下界，高于则判定违规")
     phash_whitelist_distance: int = Field(default=5, description="图片白名单 pHash 汉明距离阈值")

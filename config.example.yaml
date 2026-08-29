@@ -22,6 +22,7 @@ data_dir: "./data"
 thresholds:
   semantic_threshold: 0.67       # 语义层判定违规的相似度阈值
   margin_w: 0.05                 # 黑均分 − 白均分差值与 margin 比较基准
+  black_white_gap: 0.02          # 黑顶分−白顶分最小差距（黑未显著更接近白时不判违规）
   confidence_low: 0.35           # 置信度低档上界：低于此值判定安全
   confidence_high: 0.75          # 置信度高档下界：高于此值判定违规
   phash_whitelist_distance: 5    # 图片白名单 pHash 汉明距离阈值

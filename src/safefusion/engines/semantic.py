@@ -98,7 +98,9 @@ class SemanticEngine:
     v0.1 默认权重：``w_top = 0.6``、``w_margin = 0.4``、``margin_norm = 0.3``、
     ``semantic_threshold = 0.67``。
 
-    判定（PRD §3.1）：``triggered = (s_bt ≥ semantic_threshold) or (margin_signal > 0)``；
+    判定（PRD §3.1 + 防误判增强）：``triggered = (s_bt ≥ semantic_threshold
+    且 s_bt − s_wt ≥ black_white_gap) or (margin_signal > 0)`` —— 单条黑库
+    相似度再高，若与白库最高相似度差距不足（黑并未显著更接近），不判违规；
     ``category`` 取黑库最高分命中的 ``metadata.category``（缺失为 None）。
 
     降级政策（黑白库任一为空或输入无效时，**不做任何违规断言**）：
@@ -109,6 +111,7 @@ class SemanticEngine:
     _DEFAULT_THRESHOLDS: dict[str, Any] = {
         "semantic_threshold": 0.67,
         "margin_w": 0.05,
+        "black_white_gap": 0.02,
         "top_k": 5,
         "margin_norm": 0.3,
         "weights": {"w_top": 0.6, "w_margin": 0.4},
@@ -209,6 +212,7 @@ class SemanticEngine:
 
         top_hit = max(black_hits, key=self._hit_score)
         black_top_score = float(self._hit_score(top_hit))
+        white_top_score = float(max(self._hit_score(h) for h in white_hits))
         black_avg = float(np.mean([self._hit_score(h) for h in black_hits]))
         white_avg = float(np.mean([self._hit_score(h) for h in white_hits]))
 
@@ -236,7 +240,13 @@ class SemanticEngine:
             confidence_raw = w_top * black_top_score + w_margin * (margin_signal / margin_norm)
         confidence = float(np.clip(confidence_raw, 0.0, 1.0))
 
-        triggered = black_top_score >= semantic_threshold or margin_signal > 0
+        # 防误判（对齐 Node 原版）：黑库单条再相似，若与白库最高相似度差距
+        # 不足 black_white_gap，说明「黑并未显著更接近」，不判违规。
+        black_white_gap = float(eff.get("black_white_gap", 0.05))
+        triggered = (
+            black_top_score >= semantic_threshold
+            and (black_top_score - white_top_score) >= black_white_gap
+        ) or margin_signal > 0
         metadata = self._hit_metadata(top_hit)
         category = metadata.get("category") if isinstance(metadata, dict) else None
 
@@ -359,7 +369,7 @@ class SemanticEngine:
         if not ov:
             return self.thresholds
         eff = dict(self.thresholds)
-        for key in ("semantic_threshold", "margin_w", "margin_norm"):
+        for key in ("semantic_threshold", "margin_w", "margin_norm", "black_white_gap"):
             value = ov.get(key)
             if self._is_finite_number(value):
                 eff[key] = float(value)

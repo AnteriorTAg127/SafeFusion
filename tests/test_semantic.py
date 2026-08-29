@@ -88,18 +88,59 @@ class TestConfidenceFormula:
         assert out["confidence"] == 1.0
 
     def test_triggered_boundary_at_threshold(self) -> None:
+        # 黑白同分（gap=0）→ 黑未显著更接近，不触发（防误判增强）
         eng = make_engine(
             black_cos=[0.8, 0.8],
-            white_cos=[0.8, 0.8],  # margin=0 → 只看 black_top
+            white_cos=[0.8, 0.8],  # margin=0 且 gap=0
             thresholds={"semantic_threshold": 0.8, "weights": {"w_top": 1.0, "w_margin": 0.0}},
         )
-        assert eng.audit("内容", [])["triggered"] is True  # black_top == threshold
+        assert eng.audit("内容", [])["triggered"] is False  # 黑白同分不判违规
         eng2 = make_engine(
             black_cos=[0.79, 0.79],
             white_cos=[0.79, 0.79],
             thresholds={"semantic_threshold": 0.8, "weights": {"w_top": 1.0, "w_margin": 0.0}},
         )
         assert eng2.audit("内容", [])["triggered"] is False
+
+    def test_triggered_requires_black_white_gap(self) -> None:
+        # 黑顶分超阈值但白顶分几乎相同（gap 不足）→ 不触发
+        eng = make_engine(
+            black_cos=[0.82, 0.8],
+            white_cos=[0.81, 0.8],  # black_top=0.82, white_top=0.81, gap=0.01 < 0.02
+            thresholds={"semantic_threshold": 0.8, "weights": {"w_top": 1.0, "w_margin": 0.0}},
+        )
+        assert eng.audit("内容", [])["triggered"] is False
+        # 黑顶分显著高于白顶分（gap 足够）→ 触发
+        eng2 = make_engine(
+            black_cos=[0.82, 0.8],
+            white_cos=[0.6, 0.6],  # gap=0.22 >= 0.02
+            thresholds={"semantic_threshold": 0.8, "weights": {"w_top": 1.0, "w_margin": 0.0}},
+        )
+        assert eng2.audit("内容", [])["triggered"] is True
+
+    def test_triggered_gap_configurable(self) -> None:
+        # black_white_gap 可配置：调大后原触发场景翻转
+        eng = make_engine(
+            black_cos=[0.85, 0.85],
+            white_cos=[0.8, 0.8],  # gap=0.05，默认阈值 0.67 超
+            thresholds={
+                "semantic_threshold": 0.67,
+                "black_white_gap": 0.1,
+                "weights": {"w_top": 1.0, "w_margin": 0.0},
+            },
+        )
+        # gap=0.05 < 0.1 → 不触发
+        assert eng.audit("内容", [])["triggered"] is False
+        eng2 = make_engine(
+            black_cos=[0.95, 0.85],
+            white_cos=[0.8, 0.8],  # gap=0.15 >= 0.1
+            thresholds={
+                "semantic_threshold": 0.67,
+                "black_white_gap": 0.1,
+                "weights": {"w_top": 1.0, "w_margin": 0.0},
+            },
+        )
+        assert eng2.audit("内容", [])["triggered"] is True
 
 
 class TestOverrideCoverage:
