@@ -38,6 +38,7 @@ embedding:
     base_url: null               # 云端 Embedding API base_url，如 https://api.openai.com/v1
     model: null                  # 云端 embedding 模型名
     api_key_env: null            # 云端 Key 所在环境变量名；null 时仅认 SAFEFUSION_EMBEDDING_API_KEY
+    allow_no_key: false          # 本地无鉴权服务（llama.cpp --embeddings）可置 true 免 Key
 
 # ---- LLM 兜底（OpenAI 兼容）----
 llm:

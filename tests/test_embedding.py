@@ -121,6 +121,31 @@ class TestFactoryRouting:
                 {"backend": "cloud", "cloud": {"base_url": "http://x", "model": "m"}}
             )
 
+    def test_cloud_allow_no_key_no_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """allow_no_key=true 时无 Key 可实例化，且不携带 Authorization 头。"""
+        monkeypatch.delenv("SAFEFUSION_EMBEDDING_API_KEY", raising=False)
+        captured: dict[str, Any] = {}
+
+        def _factory(*args: Any, **kwargs: Any) -> Any:
+            captured["headers"] = kwargs.get("headers")
+            return TestCloudEmbeddingApi.FakeCloudClient(
+                TestCloudEmbeddingApi.FakeCloudResponse({"data": []})
+            )
+
+        monkeypatch.setattr(emb_mod.httpx, "Client", _factory)
+        api = get_embedding_backend(
+            {
+                "backend": "cloud",
+                "cloud": {
+                    "base_url": "http://localhost:5545/v1",
+                    "model": "m",
+                    "allow_no_key": True,
+                },
+            }
+        )
+        api.close()
+        assert "Authorization" not in captured["headers"]
+
     def test_cloud_missing_base_url_raises(self) -> None:
         with pytest.raises(ValueError, match="base_url"):
             CloudEmbeddingAPI({"cloud": {"model": "m", "api_key": "k"}})

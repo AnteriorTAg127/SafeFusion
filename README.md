@@ -134,7 +134,7 @@ SafeFusion 启动：审核 API http://0.0.0.0:8000 ｜ 管理 API http://0.0.0.0
 | **正则规则** | guardian 规则库（`开发/cherry文本分类/部署/guardian_benchmark/db/lexicon.db`，R1 提取） | JSON 数组 `[{category, pattern, action, note}]` 或 CSV（`category,pattern,action`） | 已导出 `data/rules/guardian_swear.json`（24,014 条）/ `guardian_ad.json`（517 条） | v0.3.0 已直接导入 SQLite（合计 24,531 条，action=violate）；再次导入用 `POST /admin/rules` | 前端「规则管理」页（JSON/CSV 导入） | SQLite `rules` 表；规则引擎热重载后参与正则消歧 |
 | **白名单图片** | 用户提供（合规素材） | PNG / JPEG / GIF 等 | 上传后自动存 `data/whitelist/{md5}.png` | 无需手工命令 | 前端「图片白名单」页多图上传（multipart `files` 字段），`POST /admin/whitelist/images` | SQLite `whitelist_meta` 表（md5 + pHash）+ 磁盘原图 |
 | **图片语料**（语义检索用） | 用户自采（R3 指南） | jpg / png 为主（长边 ≥ 256px 为宜；gif/webp/bmp 亦可） | `data/images/black/`、`data/images/white/`（子目录按类别随意嵌套） | `scripts/normalize_assets.py --images-dir data\images`（生成图片清单） | —（清单供向量库构建） | `data/vectors/import_manifest_images.jsonl`（每行一张图，与文本清单分离） |
-| **向量库** | 黑白语料清单（文本 + 图片） | JSONL（`{pool,text,image_path,...}`） | `data/vectors/import_manifest.jsonl`（文本，135,921 行）、`import_manifest_images.jsonl`（图片） | `.venv\Scripts\python.exe scripts\build_vector_db.py`（CLIP 批量编码） | —（由脚本构建，管理端只有状态查看） | `data/vectors/` 下 black/white 双池 npz + meta + done_ids.json |
+| **向量库** | 黑白语料清单（文本 + 图片） | JSONL（`{pool,text,image_path,...}`） | `data/vectors/import_manifest.jsonl`（文本，189,262 行：black 96,786 + white 92,476 含群聊白）、`import_manifest_images.jsonl`（图片） | `.venv\Scripts\python.exe scripts\build_vector_db.py`（CLIP 批量编码） | —（由脚本构建，管理端只有状态查看） | `data/vectors/` 下 black/white 双池 npz + meta + done_ids.json |
 
 ### 3.2 语料与词库（normalize_assets）
 
@@ -151,7 +151,7 @@ SafeFusion 启动：审核 API http://0.0.0.0:8000 ｜ 管理 API http://0.0.0.0
 
 R2 已从真实群聊记录清洗出白语料 `data/corpus/white_groupchat.csv`（**新增 53,341 条**，label=0 / category=groupchat / source=node:白群聊.csv，与既有白语料跨库去重）。合并后白池总数 = 39,135 + 53,341 = **92,476 条**。
 
-- 若要让群聊语料参与**语义检索**：将 `white_groupchat.csv` 文本行并入归一化的白池输入（或直接并入 `white.csv` 后重新归一化），再执行 `build_vector_db.py` 重建白池；
+- 若要让群聊语料参与**语义检索**：执行 `scripts\merge_manifest.py` 将 `white_groupchat.csv` 并入白池清单（池内 `(pool,text)` 去重，幂等），再执行 `build_vector_db.py` 重建白池；
 - 若要让群聊语料出现在**「试运行」随机示例**：试运行抽样读取 `data/corpus/white.csv` 头部（每池 ≤400 候选），把群聊语料合入该文件即可；
 - 现状：`data/corpus/` 中 `white.csv` 与 `white_groupchat.csv` 两个文件并存，未改动既有人工语料；是否重归一化由部署方按需执行（幂等，`done_ids.json` 断点续跑）。
 
@@ -189,15 +189,21 @@ data/images/
 ### 3.5 构建向量库（build_vector_db）
 
 ```bash
-.venv\Scripts\python.exe scripts\build_vector_db.py                 # 全量（13.6 万条，GPU 优先）
+# 本地 Chinese-CLIP（默认，GPU 优先；全量 18.9 万条）
+.venv\Scripts\python.exe scripts\build_vector_db.py
+# 云端 / 本地 OpenAI 兼容 Embedding API（如 llama.cpp llama-server --embeddings）
+.venv\Scripts\python.exe scripts\build_vector_db.py --backend cloud `
+    --base-url http://127.0.0.1:5545/v1 --cloud-model WeMM-Embedding-2B-Q4_K_M.gguf `
+    --no-api-key
 .venv\Scripts\python.exe scripts\build_vector_db.py --dry-run       # 只统计不编码
 .venv\Scripts\python.exe scripts\build_vector_db.py --max-rows 5    # 调试小样本
 .venv\Scripts\python.exe scripts\build_vector_db.py --model <本地权重目录>  # 离线 / 内网环境
 ```
 
-- **权重**：首次运行自动从 HuggingFace 下载 `OFA-Sys/chinese-clip-vit-base-patch16`（数百 MB）；离线环境用 `--model` 指向已下载权重；
+- **后端选择**：`--backend local`（默认，Chinese-CLIP）| `--backend cloud`（OpenAI 兼容 API，`--base-url` 必填，`--no-api-key` 用于本地无鉴权服务如 llama.cpp）；
+- **权重**：local 后端首次运行自动从 HuggingFace 下载 `OFA-Sys/chinese-clip-vit-base-patch16`（数百 MB）；离线环境用 `--model` 指向已下载权重；cloud 后端无本地权重依赖；
 - **断点续跑**：已编码 id 记录在 `data/vectors/done_ids.json`，中断后重跑自动跳过；**全量重建** = 清空 `data/vectors/` 后重跑；
-- 其余参数：`--manifest`（清单路径）/ `--out` / `--batch 64`（显存不足调小）/ `--device auto|cpu|cuda` / `--resume / --no-resume`；
+- 其余参数：`--manifest`（清单路径）/ `--out` / `--batch 64`（显存不足调小）/ `--device auto|cpu|cuda` / `--resume / --no-resume` / `--cloud-timeout`（cloud 单次请求超时）；
 - 图片清单（`import_manifest_images.jsonl`）同样经此脚本编码入库（`is_image_row` 分支按 `image_path` 走图片编码管线）。
 
 ---
@@ -614,7 +620,7 @@ src/safefusion/
 ├── storage/        # SQLite DAO（6 表，含 settings 配置表）+ 自研 numpy 向量库
 ├── config.py       # 配置模型与加载（默认值 → YAML → 环境变量）
 └── logging_setup.py
-scripts/            # normalize_assets.py（资产归一化，含 --images-dir）；build_vector_db.py（向量库构建）
+scripts/            # normalize_assets.py（资产归一化，含 --images-dir）；merge_manifest.py（群聊白并入清单）；build_vector_db.py（向量库构建）
 web/                # 前端管理面板（Vue3+Vite+TS；node_modules/dist 不入库）
 tests/              # pytest 用例
 data/               # 运行时数据（gitignored：audit.db / corpus / keywords / rules / whitelist / vectors / models / backups / review_reports）

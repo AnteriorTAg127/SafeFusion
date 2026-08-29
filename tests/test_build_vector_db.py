@@ -164,7 +164,7 @@ class TestMainNoTorch:
     ) -> None:
         manifest = _write_manifest(tmp_path / "m.jsonl", [{"pool": "black", "text": "甲"}])
 
-        def _boom(model: str | None, device: str) -> None:
+        def _boom(args: Any) -> None:
             raise RuntimeError("torch 未安装")
 
         monkeypatch.setattr(mod, "build_backend", _boom)
@@ -197,7 +197,7 @@ class TestMainFullRunWithFakeBackend:
         )
         out = tmp_path / "vec"
         fake = _FakeClip()
-        monkeypatch.setattr(mod, "build_backend", lambda model, device: fake)
+        monkeypatch.setattr(mod, "build_backend", lambda args: fake)
 
         rc = mod.main(["--manifest", str(manifest), "--out", str(out), "--max-rows", "5"])
         assert rc == 0

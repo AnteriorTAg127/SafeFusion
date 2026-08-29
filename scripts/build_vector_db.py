@@ -121,6 +121,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=f"覆盖 CLIP model_name（HF 模型名或本地权重目录），默认 {_DEFAULT_MODEL}",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("local", "cloud"),
+        default="local",
+        help="Embedding 后端：local（本地 Chinese-CLIP，默认）| cloud（OpenAI 兼容 API）",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="cloud 后端的 base_url（如 http://127.0.0.1:5545/v1）",
+    )
+    parser.add_argument(
+        "--cloud-model",
+        default=None,
+        help="cloud 后端的模型名（默认取 --model 的值）",
+    )
+    parser.add_argument(
+        "--cloud-timeout",
+        type=float,
+        default=60.0,
+        help="cloud 后端单次请求超时秒数（默认 60；大批量编码建议调大）",
+    )
+    parser.add_argument(
+        "--no-api-key",
+        action="store_true",
+        help="cloud 后端允许无 API Key（本地无鉴权服务如 llama.cpp --embeddings）",
+    )
     return parser.parse_args(argv)
 
 
@@ -208,11 +235,25 @@ def write_done_ids(out_dir: Path, done: set[str]) -> None:
     )
 
 
-def build_backend(model: str | None, device: str) -> BaseEmbedding:
-    """按 T15 契约经工厂获取本地 Chinese-CLIP 后端（L2 归一化由后端保证）。"""
-    local_cfg: dict[str, Any] = {"device": device}
-    if model:
-        local_cfg["model_name"] = model
+def build_backend(args: argparse.Namespace) -> BaseEmbedding:
+    """按 T15 契约经工厂获取 Embedding 后端（L2 归一化由后端保证）。
+
+    local：本地 Chinese-CLIP；cloud：OpenAI 兼容 API（--base-url 必填，
+    支持 --no-api-key 无鉴权本地服务）。
+    """
+    if args.backend == "cloud":
+        if not args.base_url:
+            raise ValueError("--backend cloud 需要 --base-url（如 http://127.0.0.1:5545/v1）")
+        cloud_cfg: dict[str, Any] = {
+            "base_url": args.base_url,
+            "model": args.cloud_model or args.model or _DEFAULT_MODEL,
+            "timeout": args.cloud_timeout,
+            "allow_no_key": bool(args.no_api_key),
+        }
+        return get_embedding_backend({"backend": "cloud", "cloud": cloud_cfg})
+    local_cfg: dict[str, Any] = {"device": args.device}
+    if args.model:
+        local_cfg["model_name"] = args.model
     return get_embedding_backend({"backend": "local", "local": local_cfg})
 
 
@@ -396,6 +437,12 @@ def format_run_report(
     lines.append(f"清单范围  : {scope_rows} 行（black {n_black} / white {n_white}）{trunc_note}")
     lines.append(f"断续续跑  : {'开' if args.resume else '关'}（跳过已入库 {skipped_done} 条）")
     lines.append(f"模型      : {args.model or _DEFAULT_MODEL}（device={args.device}）")
+    if args.backend == "cloud":
+        cloud_model = args.cloud_model or args.model or _DEFAULT_MODEL
+        lines.append(
+            f"后端      : cloud（{args.base_url}，model={cloud_model}"
+            f"，no_api_key={bool(args.no_api_key)}）"
+        )
     lines.append(f"本次编码  : black {encoded_black} / white {encoded_white}，失败 {failed} 条")
     lines.append(f"入库总数  : black {store.count('black')} / white {store.count('white')}")
     lines.append(f"向量维度  : {dim if dim is not None else '本次未编码（已全部在库）'}")
@@ -466,10 +513,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        backend = build_backend(args.model, args.device)
+        backend = build_backend(args)
     except (RuntimeError, ImportError, OSError, ValueError) as exc:
-        logger.error("本地 Chinese-CLIP 后端不可用")
-        print(format_backend_error(args.model, exc))
+        logger.error("Embedding 后端不可用")
+        if args.backend == "cloud":
+            print(f"cloud Embedding 后端初始化失败：{exc}")
+        else:
+            print(format_backend_error(args.model, exc))
         return 1
 
     batch_size = max(1, args.batch)

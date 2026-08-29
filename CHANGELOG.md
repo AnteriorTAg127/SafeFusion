@@ -2,6 +2,20 @@
 
 本文件记录 SafeFusion 面向用户的版本变更（[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本）。内部开发日志见 `开发/changelog.md`（不入库）；真实数据不在本仓库分发，见 README「数据资产」。
 
+## [0.2.2] - 2026-08-28
+
+### Added
+
+- **向量库全量构建（v0.2.2 事项落地）**：189,262 条文本全部编码入库（black 96,786 + white 92,476），2048 维 L2 归一化，`data/vectors/` 双池 npz + meta + done_ids.json 断点续跑
+- **在线 Embedding 联调（llama.cpp 本地服务）**：`CloudEmbeddingAPI` 新增 `allow_no_key`（无鉴权本地服务如 `llama-server --embeddings` 免 Key，默认 False 保留云端强制 Key 安全语义）；`build_vector_db.py` 新增 `--backend cloud`（`--base-url` / `--cloud-model` / `--no-api-key` / `--cloud-timeout`）
+- **群聊白语料并入**：`scripts/merge_manifest.py` 将 `white_groupchat.csv`（53,341 条）并入向量导入清单（池内 `(pool,text)` 去重、幂等、`--dry-run`）
+- **测试**：新增 allow_no_key 用例与 build_vector_db cloud 参数解析用例；581 pytest 全绿、ruff 全绿
+
+### Notes
+
+- 向量库构建由脚本完成，管理端仅状态查看（`/admin/models`）；图片语料待用户提供后经 `normalize_assets.py --images-dir` 并入图片清单再增量构建
+- 构建使用 5545 端口的 WeMM-Embedding-2B-Q4_K_M（llama.cpp，2048 维），耗时约数小时；中断后重跑 `build_vector_db.py` 自动续跑
+
 ## [0.3.0] - 2026-08-27
 
 ### Added

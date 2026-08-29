@@ -73,6 +73,10 @@ class EmbeddingCloudConfig(_BaseConfig):
         description="云端 Key 环境变量名；null 时仅认 SAFEFUSION_EMBEDDING_API_KEY",
     )
     api_key: str | None = Field(default=None, description="云端 Key（仅从环境变量解析）")
+    allow_no_key: bool = Field(
+        default=False,
+        description="本地无鉴权服务（如 llama.cpp --embeddings）允许无 Key；默认 False 强制 Key",
+    )
 
 
 class EmbeddingConfig(_BaseConfig):

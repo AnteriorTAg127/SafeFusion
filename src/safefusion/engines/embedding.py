@@ -244,7 +244,11 @@ class CloudEmbeddingAPI(BaseEmbedding):
     - ``base_url``：服务地址（必填，拼 ``/embeddings`` 调用）；
     - ``model``：embedding 模型名（必填）；
     - ``api_key_env``：Key 环境变量名（可选）；未设置时兜底读
-      ``SAFEFUSION_EMBEDDING_API_KEY``。二者均缺失实例化抛 ``RuntimeError``。
+      ``SAFEFUSION_EMBEDDING_API_KEY``。
+    - ``allow_no_key``：bool，默认 False。本地自建 OpenAI 兼容服务（如 llama.cpp
+      llama-server ``--embeddings``）通常无鉴权；置 True 时 Key 缺失不抛异常，
+      请求不带 Authorization 头（仅限内网信任环境）。默认为 False 保留云端强制
+      Key 的安全语义。
 
     图像 base64 编码在内存进行（Pillow BytesIO），不入盘、不写日志。
     """
@@ -262,19 +266,18 @@ class CloudEmbeddingAPI(BaseEmbedding):
             raise ValueError("云端 Embedding 后端需要配置 embedding.cloud.model")
 
         api_key = self._resolve_api_key(cloud)
-        if not api_key:
+        allow_no_key = bool(cloud.get("allow_no_key", False))
+        if not api_key and not allow_no_key:
             env_hint = cloud.get("api_key_env") or _STANDARD_KEY_ENV
             raise RuntimeError(
                 "云端 Embedding 后端未配置 API Key（密钥只允许来自环境变量）。"
                 f"请设置环境变量 {env_hint}（或 YAML 中 embedding.cloud.api_key_env"
-                " 指向的变量名）后重启服务。"
+                " 指向的变量名）；本地无鉴权服务可设 allow_no_key=true 放行。"
             )
 
         timeout_ms = float(cloud.get("timeout", _DEFAULT_CLOUD_TIMEOUT))
-        self._client = httpx.Client(
-            timeout=timeout_ms,
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._client = httpx.Client(timeout=timeout_ms, headers=headers)
         #: 云端输出维度未知，首次编码后记录（空输入时不可用）
         self._output_dim: int | None = None
 
