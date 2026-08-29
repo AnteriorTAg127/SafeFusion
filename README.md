@@ -192,18 +192,20 @@ data/images/
 # 本地 Chinese-CLIP（默认，GPU 优先；全量 18.9 万条）
 .venv\Scripts\python.exe scripts\build_vector_db.py
 # 云端 / 本地 OpenAI 兼容 Embedding API（如 llama.cpp llama-server --embeddings）
+# 最优并发参数（RTX 2080Ti + WeMM-Embedding-2B 实测约 40 条/s，全量约 1.3h）：
 .venv\Scripts\python.exe scripts\build_vector_db.py --backend cloud `
     --base-url http://127.0.0.1:5545/v1 --cloud-model WeMM-Embedding-2B-Q4_K_M.gguf `
-    --no-api-key
+    --no-api-key --batch 128 --workers 8
 .venv\Scripts\python.exe scripts\build_vector_db.py --dry-run       # 只统计不编码
 .venv\Scripts\python.exe scripts\build_vector_db.py --max-rows 5    # 调试小样本
 .venv\Scripts\python.exe scripts\build_vector_db.py --model <本地权重目录>  # 离线 / 内网环境
 ```
 
 - **后端选择**：`--backend local`（默认，Chinese-CLIP）| `--backend cloud`（OpenAI 兼容 API，`--base-url` 必填，`--no-api-key` 用于本地无鉴权服务如 llama.cpp）；
+- **并发调优**：cloud 后端支持 `--workers N`（默认 8，线程池并发编码，每 worker 独立连接）与 `--batch N`（默认 64）。实测 RTX 2080 Ti + WeMM-Embedding-2B（llama.cpp）最优为 **batch 128 × workers 8 ≈ 40 条/s**；服务端需 `--parallel ≥ workers` 且 `-c = parallel × 2048`（llama.cpp 共享上下文，每并发需约 2048 token）；可用 `scripts/bench_embedding.py` 网格测试找本机最优；
 - **权重**：local 后端首次运行自动从 HuggingFace 下载 `OFA-Sys/chinese-clip-vit-base-patch16`（数百 MB）；离线环境用 `--model` 指向已下载权重；cloud 后端无本地权重依赖；
 - **断点续跑**：已编码 id 记录在 `data/vectors/done_ids.json`，中断后重跑自动跳过；**全量重建** = 清空 `data/vectors/` 后重跑；
-- 其余参数：`--manifest`（清单路径）/ `--out` / `--batch 64`（显存不足调小）/ `--device auto|cpu|cuda` / `--resume / --no-resume` / `--cloud-timeout`（cloud 单次请求超时）；
+- 其余参数：`--manifest`（清单路径）/ `--out` / `--device auto|cpu|cuda` / `--resume / --no-resume` / `--cloud-timeout`（cloud 单次请求超时）；
 - 图片清单（`import_manifest_images.jsonl`）同样经此脚本编码入库（`is_image_row` 分支按 `image_path` 走图片编码管线）。
 
 ---

@@ -216,6 +216,48 @@ class TestMainFullRunWithFakeBackend:
         assert "black 0 / white 0" in captured.out  # 完成报告显示本次零编码
         assert fake.text_calls == first_run_calls  # 未发起任何二次编码（断点续跑全部跳过）
 
+    def test_cloud_workers_concurrent_build(
+        self,
+        mod: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """cloud 后端 + 多 worker 并发：入库总数与 done_ids 正确（不重复/不丢）。"""
+        manifest = _write_manifest(
+            tmp_path / "m.jsonl",
+            [
+                {"pool": "black", "text": f"黑样本{i}", "category": "色情", "source": "s1"}
+                for i in range(12)
+            ],
+        )
+        out = tmp_path / "vec"
+        fake = _FakeClip()
+        monkeypatch.setattr(mod, "build_backend", lambda args: fake)
+
+        rc = mod.main(
+            [
+                "--manifest",
+                str(manifest),
+                "--out",
+                str(out),
+                "--backend",
+                "cloud",
+                "--base-url",
+                "http://127.0.0.1:5545/v1",
+                "--no-api-key",
+                "--workers",
+                "3",
+                "--batch",
+                "2",
+            ]
+        )
+        assert rc == 0
+        store = NumpyVectorStore.load(out)
+        assert store.count("black") == 12
+        ids = json.loads((out / "done_ids.json").read_text(encoding="utf-8"))["ids"]
+        assert len(ids) == 12
+        assert len(set(ids)) == 12  # 无重复 id（并发下不丢不重）
+
 
 class TestHelpers:
     def test_build_items_truncates_text_and_metadata(self, mod: Any) -> None:

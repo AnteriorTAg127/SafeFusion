@@ -42,7 +42,9 @@ import io
 import json
 import logging
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +149,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-api-key",
         action="store_true",
         help="cloud 后端允许无 API Key（本地无鉴权服务如 llama.cpp --embeddings）",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="cloud 后端并发编码 worker 数（默认 8；配合服务端 --parallel 高槽位，"
+        "小 batch + 高并发吞吐最优；local 后端忽略）",
     )
     return parser.parse_args(argv)
 
@@ -512,8 +521,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("无待编码条目（已全部在库），直接结束")
         return 0
 
+    # 并发编码：cloud 后端用线程池（每 worker 独立 httpx.Client），local 后端共享单实例
+    # （torch 推理自身并行；并发无收益且显存翻倍）。checkpoint/入库在主线程串行。
+    workers = max(1, args.workers) if args.backend == "cloud" else 1
     try:
-        backend = build_backend(args)
+        backends = [build_backend(args) for _ in range(workers)]
     except (RuntimeError, ImportError, OSError, ValueError) as exc:
         logger.error("Embedding 后端不可用")
         if args.backend == "cloud":
@@ -530,20 +542,32 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     dim: int | None = None
     start = time.perf_counter()
+    batches = [
+        pending[start_idx : start_idx + batch_size]
+        for start_idx in range(0, total, batch_size)
+    ]
+    _add_lock = threading.Lock()
 
-    for batch_no, start_idx in enumerate(range(0, total, batch_size), start=1):
-        chunk = pending[start_idx : start_idx + batch_size]
+    def _encode_chunk(
+        worker_no: int, chunk: list[tuple[str, dict[str, Any]]]
+    ) -> tuple[list[VectorItem], int]:
+        """单个 worker 编码一批：文本/图像分别编码，返回 (items, 失败数)。"""
+        b = backends[worker_no % len(backends)]
         text_pairs = [(rid, row) for rid, row in chunk if not is_image_row(row)]
         image_pairs = [(rid, row) for rid, row in chunk if is_image_row(row)]
-
         items: list[VectorItem] = []
         if text_pairs:
-            items.extend(build_items(text_pairs, encode_texts_safely(backend, text_pairs)))
+            items.extend(build_items(text_pairs, encode_texts_safely(b, text_pairs)))
         if image_pairs:
-            items.extend(build_items(image_pairs, encode_images_safely(backend, image_pairs)))
+            items.extend(build_items(image_pairs, encode_images_safely(b, image_pairs)))
+        return items, len(chunk) - len(items)
 
+    def _consume_one(batch_no: int, items: list[VectorItem], chunk_failed: int) -> None:
+        """主线程消费单批 worker 结果：入库 + 统计 + 周期 checkpoint。"""
+        nonlocal encoded_black, encoded_white, failed, dim
         if items:
-            store.add(items)
+            with _add_lock:
+                store.add(items)
             done.update(item.id for item in items)
             if dim is None:
                 dim = int(items[0].vector.shape[0])
@@ -552,10 +576,10 @@ def main(argv: list[str] | None = None) -> int:
                     encoded_black += 1
                 else:
                     encoded_white += 1
-        failed += len(chunk) - len(items)
-
+        failed += chunk_failed
         if batch_no % _SAVE_EVERY_BATCHES == 0:
-            store.save()
+            with _add_lock:
+                store.save()
             write_done_ids(out_dir, done)
             logger.info(
                 "检查点保存完成（第 %d/%d 批，已入库 %d/%d 条）",
@@ -573,6 +597,25 @@ def main(argv: list[str] | None = None) -> int:
             total,
             failed,
         )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_encode_chunk, i % workers, chunk): (i + 1, chunk)
+            for i, chunk in enumerate(batches)
+        }
+        # as_completed 边收边入库（保持 checkpoint 周期落盘；统计按完成顺序）
+        for fut in as_completed(futures):
+            batch_no, _chunk = futures[fut]
+            try:
+                items, chunk_failed = fut.result()
+            except Exception as exc:  # noqa: BLE001 - worker 异常不拖垮整体
+                logger.error("批次 %d 编码异常，按整批失败处理: %s", batch_no, exc)
+                items, chunk_failed = [], len(_chunk)
+            _consume_one(batch_no, items, chunk_failed)
+
+    for b in backends:
+        if hasattr(b, "close"):
+            b.close()
 
     store.save()
     write_done_ids(out_dir, done)
