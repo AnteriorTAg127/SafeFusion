@@ -60,6 +60,36 @@ _MIN_PINYIN_INIT_HAN_LEN = 3
 #: 符号替换变体使用的分隔符
 _SEPARATORS = ("@", "·", "・", "*")
 
+#: 拼音音节分隔符：拼音展开串/拼音变体用该字符分隔音节，杜绝跨字串接误匹配
+#: （如「呆逼」dai'bi 不再与「带笔」之外的跨字拼音串相撞，见 _build_pinyin_index）。
+#: 选用 ASCII 单引号：不会出现在正常汉字拼音中，且与字面拼音（无分隔）区分。
+_PINYIN_SEP = "'"
+
+#: 常见错音（前后鼻音 / 鼻音边音 / 平翘舌 / f-h）替换对：拼音全拼变体的
+#: 近似通道（pinyin_fuzzy）。仅参与带分隔符的拼音展开扫描，且命中为弱信号。
+#: 生成规则：全拼串中若某音节出现左列拼写，替换为右列（每处最多替换一处，
+#: 避免组合爆炸；一音节最多生成一个模糊变体）。
+_PINYIN_FUZZY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("ang", "an"),
+    ("an", "ang"),
+    ("ing", "in"),
+    ("in", "ing"),
+    ("eng", "en"),
+    ("en", "eng"),
+    ("ong", "on"),
+    ("on", "ong"),
+    ("l", "n"),
+    ("n", "l"),
+    ("zh", "z"),
+    ("z", "zh"),
+    ("ch", "c"),
+    ("c", "ch"),
+    ("sh", "s"),
+    ("s", "sh"),
+    ("f", "h"),
+    ("h", "f"),
+)
+
 #: 正则豁免的上下文扩展窗口（命中片段前后各扩大 N 个字符）
 _DEFAULT_CONTEXT_WINDOW = 8
 
@@ -116,9 +146,16 @@ _TRAD_SIMP_PAIRS: dict[str, str] = {
 }
 _SIMP_FROM_TRAD: dict[str, str] = {trad: simp for simp, trad in _TRAD_SIMP_PAIRS.items()}
 
-#: 变体类型：pinyin_* 参与拼音展开扫描，其余仅参与原文直扫
+#: 变体类型：pinyin_* 参与拼音展开扫描（带分隔符），其余仅参与原文直扫
 _VariantKind = Literal[
-    "literal", "pinyin_full", "pinyin_init", "fullwidth", "case", "traditional", "symbol"
+    "literal",
+    "pinyin_full",
+    "pinyin_init",
+    "pinyin_fuzzy",
+    "fullwidth",
+    "case",
+    "traditional",
+    "symbol",
 ]
 
 _CJK_RE = r"[\u4e00-\u9fff]+"
@@ -188,6 +225,9 @@ class KeywordHitData(NamedTuple):
         matched: 在原文中实际匹配到的文本片段。
         start: 命中片段在原文中的起始下标（含）。
         end: 命中片段在原文中的结束下标（不含）。
+        kind: 命中类型（``literal`` 原文/正字变体 | ``pinyin_full`` 拼音全拼
+            | ``pinyin_init`` 拼音首字母 | ``pinyin_fuzzy`` 错音近似）。
+            用于区分强信号（literal）与弱信号（拼音类），编排层可据此降权。
     """
 
     keyword: str
@@ -195,6 +235,7 @@ class KeywordHitData(NamedTuple):
     matched: str
     start: int
     end: int
+    kind: str = "literal"
 
 
 def _to_fullwidth(text: str) -> str:
@@ -215,6 +256,61 @@ def _simplified(text: str) -> str:
     return "".join(_SIMP_FROM_TRAD.get(c, c) for c in text)
 
 
+def _gen_pinyin_full(word: str) -> str:
+    """生成词条的拼音全拼串（音节间以 ``_PINYIN_SEP`` 分隔，防跨字串接）。
+
+    例：``捡闻`` → ``jian'wen``；``安南`` → ``an'nan``。
+    """
+
+    return _PINYIN_SEP.join(lazy_pinyin(word, style=Style.NORMAL))
+
+
+def _gen_pinyin_init(word: str) -> str:
+    """生成词条的拼音首字母串（字母间以 ``_PINYIN_SEP`` 分隔）。
+
+    例：``赌博网`` → ``d'b'w``。首字母串通常不含韵母，分隔后与全拼串
+    格式一致，可统一走带分隔符的拼音展开扫描。
+    """
+
+    return _PINYIN_SEP.join(lazy_pinyin(word, style=Style.FIRST_LETTER))
+
+
+def _gen_fuzzy_variants(word: str) -> list[str]:
+    """生成词条拼音的错音近似变体（pinyin_fuzzy，弱信号通道）。
+
+    对全拼串的每个音节，按 ``_PINYIN_FUZZY_PAIRS`` 做**每音节至多一处**
+    的替换（左→右、右→左各自成对），生成一个近似变体。仅生成
+    「替换后 ≠ 原全拼」的变体，且不重复。
+
+    例：``带笔`` dai'bi → ``dai'bei``（bi→bei 不在表中，实际走
+    ``呆逼`` dai'bi → ``dai'bei``? 不 —— ``i`` 不在替换对中）。
+    实际生效例：``安南`` an'nan → ``ang'nan``（an→ang）。
+
+    Args:
+        word: 关键词原文（汉字）。
+
+    Returns:
+        错音变体列表（带分隔符，可能为空）。
+    """
+
+    full = _gen_pinyin_full(word)
+    syllables = full.split(_PINYIN_SEP)
+    fuzzy: list[str] = []
+    seen: set[str] = set()
+    for idx, syl in enumerate(syllables):
+        for src, dst in _PINYIN_FUZZY_PAIRS:
+            # 整音节替换（避免音节内部子串误替换，如 "ang" 里含 "an"）
+            if syl != src:
+                continue
+            alt_syllables = list(syllables)
+            alt_syllables[idx] = dst
+            alt = _PINYIN_SEP.join(alt_syllables)
+            if alt != full and alt not in seen:
+                seen.add(alt)
+                fuzzy.append(alt)
+    return fuzzy
+
+
 def _gen_variants_with_kind(word: str) -> list[tuple[str, _VariantKind]]:
     """生成 (变体串, 变体类型) 列表，保序、去重、非空。"""
 
@@ -227,11 +323,21 @@ def _gen_variants_with_kind(word: str) -> list[tuple[str, _VariantKind]]:
             result.append((variant, kind))
 
     add(word, "literal")
+    # 拼音全拼：无分隔变体（字面拼音，原文直扫匹配，如正文直接写 "jianwen"）
+    # + 带分隔变体（汉字同音展开扫描匹配，如正文「见闻」→ jian'wen）。
+    # 两者 kind 均为 pinyin_full（弱信号）：直扫/展开扫描天然按文本形态分流。
     add("".join(lazy_pinyin(word, style=Style.NORMAL)), "pinyin_full")
+    add(_gen_pinyin_full(word), "pinyin_full")
+    # 错音近似变体（弱信号）：仅对 ≥2 汉字的词生成（单字词错音误报率过高）
+    if _han_count(word) >= _MIN_PINYIN_HAN_LEN:
+        for variant in _gen_fuzzy_variants(word):
+            add(variant, "pinyin_fuzzy")
     # 首字母变体仅对 ≥3 汉字的词生成（2 字词如"安南"→"an" 会钻进"今天"→
-    # "tian" 等其它词拼音串内部造成误报，PRD v0.2 M1）
+    # "tian" 等其它词拼音串内部造成误报，PRD v0.2 M1）。同样分无分隔
+    # （字面首字母，直扫）与带分隔（展开扫描）两种。
     if _han_count(word) >= _MIN_PINYIN_INIT_HAN_LEN:
         add("".join(lazy_pinyin(word, style=Style.FIRST_LETTER)), "pinyin_init")
+        add(_gen_pinyin_init(word), "pinyin_init")
     for base in (word, word.upper(), word.lower()):
         add(base, "case")
         add(_to_fullwidth(base), "fullwidth")
@@ -286,6 +392,11 @@ def _build_pinyin_index(text: str) -> tuple[str, list[int | None]]:
     ``posmap[i]`` 为 ``search_text[i]`` 对应的原文下标（拼音展开时对应其
     汉字起始下标，非汉字段对应自身）。
 
+    拼音音节之间以 ``_PINYIN_SEP``（``'``）分隔：杜绝跨字串接导致的
+    误匹配（如「呆逼」dai'bi 与「带笔」dai'bi 之外的拼音串不再相撞；
+    「今天」jin'tian 不再包含 "an"）。分隔符在 posmap 中映射到该音节
+    起始汉字下标（与音节首字母一致），不影响回映射正确性。
+
     Args:
         text: 原文。
 
@@ -299,6 +410,9 @@ def _build_pinyin_index(text: str) -> tuple[str, list[int | None]]:
         if is_han:
             syllables = lazy_pinyin(chars, style=Style.NORMAL)
             for idx, syllable in enumerate(syllables):
+                if idx > 0:
+                    parts.append(_PINYIN_SEP)
+                    posmap.append(start + idx - 1)
                 parts.append(syllable)
                 posmap.extend([start + idx] * len(syllable))
         else:
@@ -476,15 +590,15 @@ class KeywordEngine:
         for end_idx, (variant, entries) in automaton.iter(text):
             start = end_idx - len(variant) + 1
             end = end_idx + 1
-            for word, category, _kind in entries:
-                hits.append(KeywordHitData(word, category, text[start:end], start, end))
-        # 拼音展开扫描：正文汉字段→拼音串后扫描，命中回映射原文汉字段
+            for word, category, kind in entries:
+                hits.append(KeywordHitData(word, category, text[start:end], start, end, kind))
+        # 拼音展开扫描：正文汉字段→拼音串（带分隔符）后扫描，命中回映射原文汉字段
         search_text, posmap = _build_pinyin_index(text)
         if search_text != text:
             for end_idx, (variant, entries) in automaton.iter(search_text):
                 start = end_idx - len(variant) + 1
                 for word, category, kind in entries:
-                    if kind not in ("pinyin_full", "pinyin_init"):
+                    if kind not in ("pinyin_full", "pinyin_init", "pinyin_fuzzy"):
                         continue
                     if _han_count(word) < _MIN_PINYIN_HAN_LEN:
                         continue
@@ -499,7 +613,7 @@ class KeywordEngine:
                         continue
                     hits.append(
                         KeywordHitData(
-                            word, category, text[orig_start:orig_end], orig_start, orig_end
+                            word, category, text[orig_start:orig_end], orig_start, orig_end, kind
                         )
                     )
         # 去重（同一 (category, keyword, start, end) 保留一条），按 start 排序

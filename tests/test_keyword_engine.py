@@ -116,6 +116,46 @@ class TestPinyinVariants:
         assert len(hits) == 1
         assert has_hit(hits, "接", 0, 1)
 
+    def test_pinyin_separator_blocks_cross_char_join(self) -> None:
+        # 拼音串加分隔符后，跨字串接误报消除：
+        # - 「安南」an'nan 不再命中「今天天气不错」（旧 jintian… 含 "an"）
+        # - 「虐童」nve'tong 不再命中「天天向上」（旧 tiantian… 含 "nt"）
+        eng = KeywordEngine()
+        eng.load_categories({"违规": ["安南", "虐童", "今天", "天天"]})
+        hits = eng.scan("今天天气不错 天天向上")
+        assert has_hit(hits, "今天", 0, 2)
+        assert has_hit(hits, "天天", 7, 9)
+        assert not any(h.keyword in ("安南", "虐童") for h in hits)
+
+    def test_pinyin_separator_same_sound_still_hits(self) -> None:
+        # 分隔符不影响同音匹配：带笔 dai'bi 仍命中呆逼（弱信号 pinyin_full）
+        eng = KeywordEngine()
+        eng.load_categories({"测试": ["呆逼"]})
+        hits = eng.scan("我带笔了")
+        assert any(h.keyword == "呆逼" and h.kind == "pinyin_full" for h in hits)
+
+    def test_fuzzy_variant_generated_and_matched(self) -> None:
+        # 错音变体（前/后鼻音）生成并参与匹配（弱信号 pinyin_fuzzy）
+        # 安南 an'nan 的错音变体 = ang'nan；正文「昂南」ang'nan 命中 fuzzy
+        eng = KeywordEngine()
+        eng.load_categories({"测试": ["安南"]})
+        hits = eng.scan("昂南")
+        assert any(h.keyword == "安南" and h.kind == "pinyin_fuzzy" for h in hits)
+
+    def test_hit_kind_distinguishes_literal_vs_pinyin(self) -> None:
+        # 命中 kind：原文命中 literal（强信号），同音/错音 pinyin_*（弱信号）
+        eng = KeywordEngine()
+        eng.load_categories({"测试": ["废物", "安南"]})
+        hits = eng.scan("你真是个废物 昂南")
+        kinds = {h.kind for h in hits}
+        assert "literal" in kinds  # 废物 原文命中
+        assert "pinyin_fuzzy" in kinds  # 安南 → 昂南 错音命中
+        for h in hits:
+            if h.keyword == "废物":
+                assert h.kind == "literal"
+            if h.keyword == "安南":
+                assert h.kind == "pinyin_fuzzy"
+
 
 class TestOrthographicVariants:
     """全半角 / 繁简 / 符号分隔变体。"""

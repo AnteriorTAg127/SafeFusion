@@ -355,6 +355,20 @@ class TestSemanticDegradation:
         finally:
             db.close()
 
+    async def test_degraded_pinyin_only_hit_is_safe(self, tmp_path: Path) -> None:
+        """语义降级 + 仅拼音弱命中（同音/错音）→ 不判违规（弱信号降权）。"""
+        db = Database(tmp_path / "audit.db")
+        try:
+            kw = KeywordEngine()
+            kw.load_categories({"测试": ["捡闻"]})  # 仅同音通道，无原文命中
+            orch = AuditOrchestrator(_make_container(db, keyword=kw, semantic=self._degraded()))
+            result = await orch.process_audit(AuditRequest(text="见闻很多"), "full")
+            # 弱命中阻止快速放行（进入语义层），但语义降级时不做违规证据
+            assert result.has_violation is False
+            assert result.source == "semantic"
+        finally:
+            db.close()
+
 
 class TestOverridesPermission:
     """overrides 仅 full 组可用；full 组覆盖透传语义层。"""

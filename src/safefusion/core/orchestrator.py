@@ -199,7 +199,10 @@ class AuditOrchestrator:
                 }
             )
 
-        if kept_hits:
+        # 强信号 = 原文/正字命中（kind=literal）或轻量模型违规；拼音类弱命中
+        # （pinyin_full/pinyin_init/pinyin_fuzzy）只阻止快速放行、不直接判违规，
+        # 交由语义层进一步确认（语义降级时也不作为违规证据）。
+        if any(hit.kind == "literal" for hit in kept_hits):
             strong_signal = True
         if light_result is not None and light_result.get("violation"):
             strong_signal = True
