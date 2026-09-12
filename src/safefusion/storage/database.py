@@ -135,6 +135,10 @@ class Database:
         self._path = Path(db_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        #: 知识库（词库 / 规则）写入计数器与本进程内的版本指纹缓存，
+        #: 供 :meth:`knowledge_version` 构造审核缓存键（v0.5.0 缺陷 4 修复）。
+        self._knowledge_rev = 0
+        self._knowledge_version_cache: str | None = None
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -150,6 +154,50 @@ class Database:
 
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------- knowledge version
+
+    def knowledge_version(self) -> str:
+        """返回知识库（词库 + 规则）版本指纹，供审核缓存键失效使用。
+
+        构成：``kw<词库 MAX(id)>-r<规则 MAX(id)>-rev<本进程写入计数>``。
+
+        - 写库即变：:meth:`add_keywords` / :meth:`delete_keyword` /
+          :meth:`dedup_keywords` / :meth:`add_rules` / :meth:`delete_rule` /
+          :meth:`set_rule_active` 成功后递增计数器，**任何路径**改动词库或规则
+          都会让审核缓存自然失效（自愈，不依赖每个写入点记得清理缓存）；
+        - 计数器覆盖 ``MAX(id)`` 不变的情形：停用/启用规则（``UPDATE`` 不改 id）、
+          去重或删除**非最大 id** 的行等；
+        - ``MAX(id)`` 走主键索引（O(log n)，**不做 COUNT(*) 全表扫描**），且
+          结果被记忆化——只在写库后重算一次，审核路径上是纯属性读取。
+
+        Note:
+            指纹基于**本进程**的写入计数；多进程共享同一 DB 时，其他进程的
+            写入需待本进程重启或自行调用 :meth:`_invalidate_knowledge_version`
+            才会反映（此时表现为缓存未命中而非陈旧命中，方向安全）。
+        """
+
+        with self._lock:
+            if self._knowledge_version_cache is None:
+                self._knowledge_version_cache = self._compute_knowledge_version()
+            return self._knowledge_version_cache
+
+    def _compute_knowledge_version(self) -> str:
+        """构造版本指纹字符串（**调用方须已持有 ``self._lock``**）。"""
+
+        kw_max = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM keywords").fetchone()[0]
+        rule_max = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM rules").fetchone()[0]
+        return f"kw{kw_max}-r{rule_max}-rev{self._knowledge_rev}"
+
+    def _invalidate_knowledge_version(self) -> None:
+        """标记知识库版本已变（**调用方须已持有 ``self._lock``**）。
+
+        仅在写库**确实改变了数据**时调用——写入被唯一约束跳过、删除不存在的
+        行等无变化情形不调用，避免无谓的缓存击穿。
+        """
+
+        self._knowledge_rev += 1
+        self._knowledge_version_cache = None
 
     # ------------------------------------------------------------------ keys
 
@@ -270,6 +318,8 @@ class Database:
             self._conn.commit()
             inserted = cursor.rowcount
             skipped = len(items) - inserted
+            if inserted:
+                self._invalidate_knowledge_version()
             if skipped:
                 _logger.warning("批量词条导入跳过 %d 条重复项（category+word 唯一）", skipped)
             return inserted, skipped
@@ -297,6 +347,8 @@ class Database:
         with self._lock:
             cursor = self._conn.execute("DELETE FROM keywords WHERE id = ?", (keyword_id,))
             self._conn.commit()
+            if cursor.rowcount > 0:
+                self._invalidate_knowledge_version()
             return cursor.rowcount > 0
 
     def dedup_keywords(self) -> dict[str, int]:
@@ -344,6 +396,8 @@ class Database:
             self._conn.commit()
             removed = cursor.rowcount
             after = self._conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+            if removed:
+                self._invalidate_knowledge_version()
             return {"before": before, "after": after, "removed": removed}
 
     # ------------------------------------------------------------------ rules
@@ -392,6 +446,8 @@ class Database:
             self._conn.commit()
             inserted = cursor.rowcount
             skipped = len(items) - inserted
+            if inserted:
+                self._invalidate_knowledge_version()
             if skipped:
                 _logger.warning(
                     "批量规则导入跳过 %d 条重复项（category+pattern+action 唯一）", skipped
@@ -438,6 +494,8 @@ class Database:
         with self._lock:
             cursor = self._conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
             self._conn.commit()
+            if cursor.rowcount > 0:
+                self._invalidate_knowledge_version()
             return cursor.rowcount > 0
 
     def set_rule_active(self, rule_id: int, active: bool) -> bool:
@@ -452,6 +510,8 @@ class Database:
                 "UPDATE rules SET is_active = ? WHERE id = ?", (int(active), rule_id)
             )
             self._conn.commit()
+            if cursor.rowcount > 0:
+                self._invalidate_knowledge_version()
             return cursor.rowcount > 0
 
     # ------------------------------------------------------ whitelist images

@@ -300,3 +300,68 @@ class TestDatabaseLifecycle:
             assert journal == "wal"
         finally:
             db.close()
+
+
+class TestKnowledgeVersion:
+    """知识库版本指纹（v0.5.0 缺陷 4）：审核缓存键失效依据。
+
+    要求：读取稳定（可记忆化）；任何**确实改变数据**的词库/规则写入都使指纹
+    变化；无变化的写入（重复导入、删除不存在的行、空列表）不变。
+    """
+
+    def test_stable_across_reads(self, tmp_db: Database) -> None:
+        first = tmp_db.knowledge_version()
+        assert tmp_db.knowledge_version() == first
+
+    def test_add_keywords_changes_version(self, tmp_db: Database) -> None:
+        before = tmp_db.knowledge_version()
+        assert tmp_db.add_keywords([("违禁", "洗钱", None)]) == (1, 0)
+        assert tmp_db.knowledge_version() != before
+
+    def test_delete_keyword_changes_version(self, tmp_db: Database) -> None:
+        tmp_db.add_keywords([("违禁", "洗钱", None)])
+        keyword_id = tmp_db.list_keywords()[0]["id"]
+        before = tmp_db.knowledge_version()
+        assert tmp_db.delete_keyword(keyword_id) is True
+        assert tmp_db.knowledge_version() != before
+
+    def test_set_rule_active_changes_version_without_new_id(self, tmp_db: Database) -> None:
+        """停用规则不改 ``MAX(id)`` —— 指纹必须仍变化（靠本地写入计数）。"""
+
+        tmp_db.add_rules([("广告", "加我", "exempt", None)])
+        rule_id = tmp_db.list_rules()[0]["id"]
+        assert tmp_db._compute_knowledge_version().startswith(f"kw0-r{rule_id}")
+        before = tmp_db.knowledge_version()
+        assert tmp_db.set_rule_active(rule_id, False) is True
+        after = tmp_db.knowledge_version()
+        assert after != before
+        # MAX(id) 未变，差异只能来自写入计数
+        assert tmp_db._compute_knowledge_version().split("-")[:2] == before.split("-")[:2]
+
+    def test_add_and_delete_rule_changes_version(self, tmp_db: Database) -> None:
+        before = tmp_db.knowledge_version()
+        assert tmp_db.add_rules([("广告", "加我", "exempt", None)]) == (1, 0)
+        assert tmp_db.knowledge_version() != before
+        mid = tmp_db.knowledge_version()
+        assert tmp_db.delete_rule(tmp_db.list_rules()[0]["id"]) is True
+        assert tmp_db.knowledge_version() != mid
+
+    def test_dedup_changes_version(self, tmp_db: Database) -> None:
+        tmp_db.add_keywords([("测试", "敏感词", "s1"), ("测试", "敏感词！", "s2")])
+        before = tmp_db.knowledge_version()
+        result = tmp_db.dedup_keywords()
+        assert result["removed"] == 1
+        assert tmp_db.knowledge_version() != before
+
+    def test_no_op_writes_keep_version(self, tmp_db: Database) -> None:
+        """未改变数据的写入不应使指纹变化（避免无谓的缓存击穿）。"""
+
+        tmp_db.add_keywords([("违禁", "洗钱", None)])
+        baseline = tmp_db.knowledge_version()
+        assert tmp_db.add_keywords([("违禁", "洗钱", None)]) == (0, 1)  # 重复被跳过
+        assert tmp_db.add_keywords([]) == (0, 0)  # 空列表
+        assert tmp_db.delete_keyword(99999) is False  # 不存在的行
+        assert tmp_db.delete_rule(99999) is False
+        assert tmp_db.add_rules([]) == (0, 0)
+        assert tmp_db.set_rule_active(99999, False) is False
+        assert tmp_db.knowledge_version() == baseline

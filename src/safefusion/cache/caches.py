@@ -543,14 +543,21 @@ class CacheLayer:
 
     # ---------- 高频缓存（②，无上下文请求专用） ----------
 
-    def get_high_freq(self, text_hash: str) -> dict | None:
-        """读取高频缓存（键为文本哈希）；未命中/过期返回 None。"""
-        value = self._high_freq.get(text_hash)
+    def get_high_freq(self, key: str) -> dict | None:
+        """读取高频缓存；未命中/过期返回 None。
+
+        Note:
+            ``key`` 由编排器传入**审核缓存键**（``audit_key`` 结果）——v0.5.0
+            缺陷 4 起该级缓存复用同一作用域，使词库/规则/阈值变更后同样失效。
+        """
+
+        value = self._high_freq.get(key)
         return value if isinstance(value, dict) else None
 
-    def put_high_freq(self, text_hash: str, result: dict) -> None:
-        """写入高频缓存；关闭时跳过。"""
-        self._high_freq.put(text_hash, result)
+    def put_high_freq(self, key: str, result: dict) -> None:
+        """写入高频缓存（``key`` 语义同 :meth:`get_high_freq`）；关闭时跳过。"""
+
+        self._high_freq.put(key, result)
 
     # ---------- 图片去重缓存（③，仅单图无文本请求） ----------
 

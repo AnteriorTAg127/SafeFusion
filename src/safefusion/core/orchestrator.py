@@ -6,9 +6,10 @@
 
 ① overrides 权限校验（仅 full 组可用，否则 PermissionError → T10 映射 403）；
 ② 预处理：文本规范化（NFKC + strip + 统一空白）→ sha256；图片解码 + md5/phash；
-③ 审核缓存（完整键：文本哈希 + 帧哈希 + skip_llm + overrides 摘要）；
+③ 审核缓存（完整键：文本哈希 + 帧哈希 + skip_llm + overrides 摘要 + tier +
+   知识库版本 + 生效配置指纹）；
 ④ 永久黑白名单（黑优先，逐一检查文本哈希与各帧 md5）；
-⑤ 高频缓存（仅无 context 的文本请求）；
+⑤ 高频缓存（仅无 context 的文本请求；键复用 ③ 的审核缓存键）；
 ⑥ 基础规则（关键词 + 正则消歧、轻量文本模型、逐帧图片白名单）——无短路；
 ⑦ 汇总：全部安全 → 快速放行（source=basic_rules_pass，PRD 唯一快速放行通道）；
 ⑧ 语义检索；**降级 ≠ 安全**（reason 非 None 时不作任何安全断言）；
@@ -36,24 +37,55 @@ from PIL import Image
 
 from ..engines.image_pipeline import compute_hashes, decode_images
 from ..engines.keyword_engine import KeywordHitData
+from ..engines.semantic import SemanticEngine
 from ..logging_setup import get_logger
 from ..models.schemas import AuditDetail, AuditRequest, AuditResult
 from .aggregator import decide_tier, merge_final, summarize_basic
 from .context import AppContext
 
+_logger = get_logger("core.orchestrator")
 
-def _high_freq_key(text_hash: str, tier: str) -> str:
-    """高频缓存键：文本哈希掺入 Key 分组，standard / full 结果互不污染。
 
-    T8 契约的 ``get/put_high_freq(text_hash)`` 键仅含文本哈希，而 standard
-    写入的结果无 detail，full 档直接命中会造成明细降级（主模型集成修复，
-    2026-08-26，T10 自检暴露）。
+def _knowledge_version(ctx: Any) -> str:
+    """知识库（词库 + 规则）版本指纹；能力缺失 / 数据库不可用时返回 ``"-"``。
+
+    用于审核缓存键：词库或规则变更 → 版本变化 → 缓存自然失效（v0.5.0
+    缺陷 4 修复）。取不到版本时退化为固定值，**不影响审核本身**（仅等同于
+    旧行为），并已在 Database 侧吞掉异常。
     """
 
-    return hashlib.sha256(f"{text_hash}:{tier}".encode()).hexdigest()
+    database = getattr(ctx, "database", None)
+    getter = getattr(database, "knowledge_version", None)
+    if not callable(getter):
+        return "-"
+    try:
+        return str(getter())
+    except Exception as exc:  # noqa: BLE001 - 版本不可得不应影响审核
+        _logger.warning("知识库版本读取失败（缓存键退化为固定值）: %r", exc)
+        return "-"
 
 
-_logger = get_logger("core.orchestrator")
+def _decision_cfg_fingerprint(
+    cfg: Any, th: Any, conf_low: float, conf_high: float
+) -> dict[str, Any]:
+    """参与裁决的**生效**配置指纹，使配置热应用后审核缓存自然失效。
+
+    v0.5.0 缺陷 4 修复：管理端 ``PUT /admin/config/thresholds``（及
+    ``semantic``）走 ``hot_apply`` 的参数类分支，只改配置叶子、**不重建缓存层**，
+    而阈值直接决定 ``decide_tier``——若不纳入缓存键，改完阈值后最长 1 小时
+    仍会返回按旧阈值裁决的缓存结论。
+
+    Returns:
+        可 JSON 序列化的指纹字典（由 ``audit_key`` 稳定序列化后参与 sha256）。
+    """
+
+    return {
+        "thresholds": th.model_dump(),
+        "confidence_low": float(conf_low),
+        "confidence_high": float(conf_high),
+        "regex_rules_enabled": bool(cfg.keyword.regex_rules_enabled),
+        "rerank_enabled": bool(cfg.semantic.rerank_enabled),
+    }
 
 
 class AuditOrchestrator:
@@ -146,7 +178,16 @@ class AuditOrchestrator:
                 # 键含 tier：standard 与 full 的缓存隔离，避免 full 命中
                 # standard 写入的无 detail 结果（主模型集成修复，2026-08-26，
                 # 修复 T10 报告缺陷②）。
-                {"skip_llm": req.skip_llm, "overrides": overrides_dump, "tier": key_tier},
+                # 键含 kb_version + decision_cfg（v0.5.0 缺陷 4 修复）：词库/规则
+                # 变更或阈值热应用后缓存自然失效，不再返回陈旧结论（此前最长
+                # 1 小时内任何"重新审核一次看看"都会命中旧结果）。
+                {
+                    "skip_llm": req.skip_llm,
+                    "overrides": overrides_dump,
+                    "tier": key_tier,
+                    "kb_version": _knowledge_version(ctx),
+                    "decision_cfg": _decision_cfg_fingerprint(cfg, th, conf_low, conf_high),
+                },
             )
             cached = cache_layer.get_audit_result(cache_key)
             if cached is not None:
@@ -161,8 +202,11 @@ class AuditOrchestrator:
                 return self._simple_result(False, 0.0, None, "permanent_list")
 
         # ---------- ⑤ 高频缓存（仅无 context 的文本请求） ----------
-        if cache_layer is not None and normalized and req.context is None:
-            high_hit = cache_layer.get_high_freq(_high_freq_key(text_hash, key_tier))
+        # 键**复用审核缓存键**（已含 tier / 知识库版本 / 生效配置指纹 / 帧哈希）：
+        # 此前仅 text_hash+tier，导致修好①级缓存后仍会被这一级用陈旧结论短路
+        # （v0.5.0 缺陷 4 扩展修复）。
+        if cache_layer is not None and cache_key is not None and normalized and req.context is None:
+            high_hit = cache_layer.get_high_freq(cache_key)
             if high_hit is not None:
                 return self._serve_cached(high_hit, key_tier)
 
@@ -364,7 +408,7 @@ class AuditOrchestrator:
             await ctx.ensure_semantic_async()
         semantic = self.context.semantic
         if semantic is None:
-            return _semantic_degraded(ctx.semantic_degraded_reason() or "semantic_disabled")
+            return SemanticEngine.degraded(ctx.semantic_degraded_reason() or "semantic_disabled")
         try:
             result = semantic.audit(text, frames, ov)
             if not isinstance(result, dict):
@@ -372,7 +416,7 @@ class AuditOrchestrator:
             return result
         except Exception as exc:
             _logger.warning("语义层 audit 异常（降级）: %s", exc)
-            return _semantic_degraded("semantic_exception")
+            return SemanticEngine.degraded("semantic_exception")
 
     @staticmethod
     def _permanent_hit(
@@ -499,8 +543,8 @@ class AuditOrchestrator:
 
         if cache_layer is not None and cache_key is not None:
             cache_layer.put_audit_result(cache_key, result.model_dump())
-        if cache_layer is not None and normalized and req.context is None:
-            cache_layer.put_high_freq(_high_freq_key(text_hash, key_tier), result.model_dump())
+        if cache_layer is not None and cache_key is not None and normalized and req.context is None:
+            cache_layer.put_high_freq(cache_key, result.model_dump())
         if cache_layer is not None and not normalized and len(frame_phash_hexes) == 1:
             cache_layer.put_dedup(frame_md5s[0], frame_phash_hexes[0], result.model_dump())
         if db is not None:
@@ -539,20 +583,6 @@ def _normalize_text(text: str) -> str:
     if not text:
         return ""
     return " ".join(unicodedata.normalize("NFKC", text).strip().split())
-
-
-def _semantic_degraded(reason: str) -> dict[str, Any]:
-    """构造语义层降级结果（与 engines.semantic 的降级键结构一致）。"""
-
-    return {
-        "triggered": False,
-        "confidence": 0.0,
-        "category": None,
-        "black_top": None,
-        "black_avg": 0.0,
-        "white_avg": 0.0,
-        "reason": reason,
-    }
 
 
 def _semantic_detail(semantic_result: dict[str, Any]) -> dict[str, Any]:

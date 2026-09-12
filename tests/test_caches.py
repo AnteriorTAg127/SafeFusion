@@ -238,14 +238,24 @@ class TestStatsAndHelpers:
 class _FakeRedis:
     """内存假 Redis：满足 RedisBackend 使用的异步 get/set/expire/delete/keys/ping 语义。
 
-    - ``expire`` 记录截止时刻，``get`` 命中过期键返回 None 并清除（模拟 Redis TTL）；
+    - ``expire`` 记录截止时刻与**原始秒数**（整秒，与真实 Redis 一致），``get``
+      命中过期键返回 None 并清除；``seconds=0`` 语义为立即删除（Redis EXPIRE 语义）；
     - ``broken`` 置 True 后所有调用抛 ConnectionError（模拟运行期断连，测降级路径）。
     """
 
     def __init__(self, broken: bool = False) -> None:
         self._store: dict[str, str] = {}
         self._expiry: dict[str, float] = {}
+        #: key -> 最近一次 expire 收到的原始秒数（断言"Redis 侧收到整秒值"用）
+        self._expiry_seconds: dict[str, int] = {}
         self.broken = broken
+
+    def _drop(self, key: str) -> None:
+        """清除键的存储与 TTL 记录（模拟 Redis DEL / 惰性过期清理）。"""
+
+        self._store.pop(key, None)
+        self._expiry.pop(key, None)
+        self._expiry_seconds.pop(key, None)
 
     def _check(self) -> None:
         if self.broken:
@@ -259,18 +269,18 @@ class _FakeRedis:
         self._check()
         deadline = self._expiry.get(key)
         if deadline is not None and time.monotonic() > deadline:
-            self._store.pop(key, None)
-            self._expiry.pop(key, None)
+            self._drop(key)
             return None
         return self._store.get(key)
 
     async def set(self, key: str, value: str, *args: Any, **kwargs: Any) -> None:
         self._check()
+        self._drop(key)  # 普通 SET 清除既有 TTL
         self._store[key] = value
-        self._expiry.pop(key, None)
 
     async def expire(self, key: str, seconds: int) -> None:
         self._check()
+        self._expiry_seconds[key] = seconds
         self._expiry[key] = time.monotonic() + seconds
 
     async def delete(self, *keys: str) -> int:
@@ -278,8 +288,7 @@ class _FakeRedis:
         removed = 0
         for key in keys:
             if key in self._store:
-                self._store.pop(key, None)
-                self._expiry.pop(key, None)
+                self._drop(key)
                 removed += 1
         return removed
 
@@ -357,11 +366,33 @@ class TestRedisBackend:
         assert backend.get("k") == "v"
 
     def test_ttl_expiry_effect(self) -> None:
-        backend, _ = self._backend()
-        backend.set("k", "v", 0.05)
+        """TTL 到期后不可读（以 **1 秒**验证：Redis EXPIRE 粒度为整秒）。
+
+        原用例用 0.05 秒，经 ``int()`` 截断为 0 → 等价「立即过期」，而
+        ``time.monotonic()`` 存在时钟粒度（Windows GetTickCount64 = 15.625ms），
+        同 tick 内 ``now > now+0`` 为假 → 断言结果随平台漂移（Linux 必失败、
+        Windows 常通过）。v0.5.0 缺陷 5 修复。
+        """
+
+        backend, fake = self._backend()
+        backend.set("k", "v", 1)
+        assert fake._expiry_seconds["sf:k"] == 1  # 整秒下发
         assert backend.get("k") == "v"
-        time.sleep(0.07)
+        time.sleep(1.1)
         assert backend.get("k") is None
+
+    def test_sub_second_ttl_truncated_to_zero(self) -> None:
+        """亚秒 TTL 经 ``int()`` 截断为 0 下发 —— 语义是**立即过期**，非「短时缓存」。
+
+        断言**下发值**而非「立刻读不到」：后者仍取决于时钟粒度（见上一条用例
+        的说明），断言它会重新引入跨平台脆弱性。此用例把该隐性契约显式固化，
+        避免将来被"顺手修成别的行为"。
+        """
+
+        backend, fake = self._backend()
+        backend.set("k", "v", 0.99)
+        assert fake._expiry_seconds["sf:k"] == 0
+        assert fake._expiry_seconds["sf:k"] != 1
 
     def test_delete(self) -> None:
         backend, _ = self._backend()
@@ -428,10 +459,13 @@ class TestRedisCacheLayer:
         assert all(key.startswith("sf:") for key in fake._store)
 
     def test_ttl_controlled_by_redis_side(self) -> None:
-        cache, _ = self._layer({"audit_cache": {"ttl": 0.05, "enabled": True}})
+        """TTL 交给 Redis 侧 expire 生效（以 1 秒验证，避免亚秒截断的时钟依赖）。"""
+
+        cache, fake = self._layer({"audit_cache": {"ttl": 1, "enabled": True}})
         cache.put_audit_result("k", {"v": 1})
+        assert fake._expiry_seconds["sf:k"] == 1  # TTL 已由 Redis 侧承载
         assert cache.get_audit_result("k") == {"v": 1}
-        time.sleep(0.07)
+        time.sleep(1.1)
         assert cache.get_audit_result("k") is None  # 过期由 Redis 侧 expire 生效
 
     def test_stats_meta_on_redis(self) -> None:

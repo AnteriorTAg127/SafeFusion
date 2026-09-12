@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -227,6 +228,111 @@ class TestCacheTierIsolation:
         assert third.cache_hit is False
         assert third.detail is None  # standard 档裁剪
         assert semantic.audit_calls == 2
+
+
+class TestCacheInvalidationOnStateChange:
+    """回归（v0.5.0 缺陷 4）：词库 / 规则 / 阈值变更后审核缓存必须失效。
+
+    此前键只含 文本哈希 + 帧哈希 + skip_llm/overrides/tier，改词库或热改阈值后
+    最长 1 小时（``audit_cache`` 默认 TTL 3600s）仍返回按旧状态裁决的结论——
+    运维连「重新审核一次看看」都会命中旧结果。
+    """
+
+    @staticmethod
+    def _container(
+        db: Database, *, keyword: Any, semantic: FakeSemantic, cache: CacheLayer
+    ) -> AppContext:
+        """独立配置副本的容器：避免 ``swap_components`` 就地同步叶子污染共享 ``_DEFAULT_CFG``。"""
+
+        ctx = _make_container(db, keyword=keyword, semantic=semantic, cache=cache)
+        ctx.config = AppConfig.model_validate({})
+        return ctx
+
+    async def test_keyword_change_invalidates_cache(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        try:
+            kw = KeywordEngine()
+            kw.load_categories({})
+            ctx = self._container(db, keyword=kw, semantic=_empty_semantic(), cache=CacheLayer({}))
+            orch = AuditOrchestrator(ctx)
+            req = AuditRequest(text="他在搞洗钱活动")
+
+            assert (await orch.process_audit(req, "full")).cache_hit is False
+            assert (await orch.process_audit(req, "full")).cache_hit is True  # 状态未变 → 命中
+
+            db.add_keywords([("违禁", "洗钱", None)])
+            assert ctx.reload_keywords() is True  # 模拟管理端导入后的热重载
+            third = await orch.process_audit(req, "full")
+            assert third.cache_hit is False, "词库变更后仍命中旧缓存"
+            assert third.source != "cache"
+        finally:
+            db.close()
+
+    async def test_rule_change_invalidates_cache(self, tmp_path: Path) -> None:
+        """规则新增与停用都必须失效缓存（停用不改 ``MAX(id)``，靠写入计数捕捉）。"""
+
+        db = Database(tmp_path / "audit.db")
+        try:
+            kw = KeywordEngine()
+            kw.load_categories({"广告": ["加我"]})
+            ctx = self._container(db, keyword=kw, semantic=_empty_semantic(), cache=CacheLayer({}))
+            orch = AuditOrchestrator(ctx)
+            req = AuditRequest(text="加我")
+
+            await orch.process_audit(req, "full")
+            assert (await orch.process_audit(req, "full")).cache_hit is True
+
+            db.add_rules([("广告", "加我", "exempt", None)])
+            assert (await orch.process_audit(req, "full")).cache_hit is False
+
+            rule_id = db.list_rules()[0]["id"]
+            assert db.set_rule_active(rule_id, False) is True
+            assert (await orch.process_audit(req, "full")).cache_hit is False
+        finally:
+            db.close()
+
+    async def test_threshold_hot_apply_invalidates_cache(self, tmp_path: Path) -> None:
+        """热改阈值（参数类分组，不重建缓存层）后缓存必须失效。"""
+
+        db = Database(tmp_path / "audit.db")
+        try:
+            kw = KeywordEngine()
+            kw.load_categories({"色情": ["裸聊"]})
+            ctx = self._container(db, keyword=kw, semantic=_empty_semantic(), cache=CacheLayer({}))
+            orch = AuditOrchestrator(ctx)
+            req = AuditRequest(text="裸聊")
+
+            await orch.process_audit(req, "full")
+            assert (await orch.process_audit(req, "full")).cache_hit is True
+
+            # 走真实热应用路径：就地同步配置叶子（对象身份不变，编排器引用即时可见）
+            candidate = AppConfig.model_validate({"thresholds": {"semantic_threshold": 0.99}})
+            ctx.swap_components(candidate=candidate)
+            third = await orch.process_audit(req, "full")
+            assert third.cache_hit is False, "阈值热应用后仍命中按旧阈值裁决的缓存"
+        finally:
+            db.close()
+
+    async def test_no_op_write_keeps_cache_hit(self, tmp_path: Path) -> None:
+        """未改变数据的写入（重复导入被唯一约束跳过）不应击穿缓存。"""
+
+        db = Database(tmp_path / "audit.db")
+        try:
+            kw = KeywordEngine()
+            kw.load_categories({})
+            ctx = self._container(db, keyword=kw, semantic=_empty_semantic(), cache=CacheLayer({}))
+            orch = AuditOrchestrator(ctx)
+            req = AuditRequest(text="普通文本")
+
+            await orch.process_audit(req, "full")
+            assert (await orch.process_audit(req, "full")).cache_hit is True
+
+            db.add_keywords([("违禁", "洗钱", None)])  # 真实插入 → 版本变化
+            assert (await orch.process_audit(req, "full")).cache_hit is False
+            assert db.add_keywords([("违禁", "洗钱", None)]) == (0, 1)  # 重复 → 无变化
+            assert (await orch.process_audit(req, "full")).cache_hit is True
+        finally:
+            db.close()
 
 
 class TestLLMPaths:
