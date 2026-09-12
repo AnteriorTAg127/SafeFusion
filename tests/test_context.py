@@ -104,3 +104,119 @@ class TestReloadFailure:
 
         monkeypatch.setattr(ctx.keyword_engine, "reload", _boom)
         assert ctx.reload_keywords() is False
+
+
+class TestMultiVectorStoreLazy:
+    """多向量库：启动不加载、按需懒加载、LRU 缓存容量限制。"""
+
+    def test_build_does_not_load_default_store(self, tmp_path) -> None:
+        ctx = AppContext.build(build_config(tmp_path))
+        # 启动只记录路径，不加载实例
+        assert ctx.store is None
+        assert "default" in ctx.store_paths
+
+    def test_get_store_lazy_loads_default(self, tmp_path) -> None:
+        ctx = AppContext.build(build_config(tmp_path))
+        store = ctx.get_store("default")
+        assert store is not None
+        assert ctx.store is None  # get_store 不改变 self.store
+        assert ctx.get_store("default") is store  # 缓存复用
+
+    def test_ensure_current_store_sets_self_store(self, tmp_path) -> None:
+        ctx = AppContext.build(build_config(tmp_path))
+        store = ctx.ensure_current_store()
+        assert store is not None
+        assert ctx.store is store
+
+    def test_configured_store_paths_registered(self, tmp_path) -> None:
+        cfg = build_config(
+            tmp_path,
+            embedding={
+                "vector_stores": [{"name": "wemm", "path": "vectors/wemm"}],
+            },
+        )
+        ctx = AppContext.build(cfg)
+        assert "wemm" in ctx.store_paths
+        assert ctx.store_paths["wemm"] == tmp_path / "vectors" / "wemm"
+        # 未加载
+        assert "wemm" not in ctx._store_cache
+        # 懒加载后可用
+        store = ctx.get_store("wemm")
+        assert store is not None
+        assert ctx._store_cache.get("wemm") is store
+
+    def test_configured_empty_store_auto_reuses_default(self, tmp_path) -> None:
+        # 先创建默认库（旧单库，含至少一条数据）
+        import numpy as np
+
+        from safefusion.storage.vector_store import NumpyVectorStore, VectorItem
+
+        default = NumpyVectorStore(tmp_path / "vectors")
+        default.add(
+            [VectorItem(id="b1", pool="black", vector=np.ones(4, dtype="float32"), metadata={})]
+        )
+        default.save()
+        # 配置一个空目录的新库；启动时自动规范化到默认库路径
+        cfg = build_config(
+            tmp_path,
+            embedding={
+                "vector_stores": [{"name": "wemm", "path": "vectors/wemm"}],
+            },
+        )
+        ctx = AppContext.build(cfg)
+        # 不复制文件，直接复用默认库目录
+        assert ctx.store_paths["wemm"] == tmp_path / "vectors"
+        assert ctx.store_paths["default"] == tmp_path / "vectors"
+        store = ctx.get_store("wemm")
+        assert store is not None
+        # 加载的库与默认库是同一份数据（路径相同）
+        assert store._path == default._path
+
+    def test_configured_nonempty_store_keeps_own_path(self, tmp_path) -> None:
+        import numpy as np
+
+        from safefusion.storage.vector_store import NumpyVectorStore, VectorItem
+
+        # 旧默认库存在
+        default = NumpyVectorStore(tmp_path / "vectors")
+        default.add(
+            [VectorItem(id="b1", pool="black", vector=np.ones(4, dtype="float32"), metadata={})]
+        )
+        default.save()
+        # 配置一个已有独立数据的库
+        wemm_dir = tmp_path / "vectors" / "wemm"
+        wemm_dir.mkdir(parents=True)
+        wemm = NumpyVectorStore(str(wemm_dir))
+        wemm.add(
+            [VectorItem(id="w1", pool="white", vector=np.ones(4, dtype="float32"), metadata={})]
+        )
+        wemm.save()
+        cfg = build_config(
+            tmp_path,
+            embedding={
+                "vector_stores": [{"name": "wemm", "path": "vectors/wemm"}],
+            },
+        )
+        ctx = AppContext.build(cfg)
+        assert ctx.store_paths["wemm"] == wemm_dir
+
+    def test_lru_evicts_oldest(self, tmp_path) -> None:
+        cfg = build_config(
+            tmp_path,
+            embedding={
+                "vector_stores": [
+                    {"name": "a", "path": "vectors/a"},
+                    {"name": "b", "path": "vectors/b"},
+                ]
+            },
+        )
+        ctx = AppContext.build(cfg)
+        sa = ctx.get_store("a")
+        sb = ctx.get_store("b")
+        assert sa is not None and sb is not None
+        # 容量 2，再加载第三个应淘汰 a（a 是最旧）
+        sc = ctx.get_store("default")
+        assert sc is not None
+        assert "a" not in ctx._store_cache
+        assert "b" in ctx._store_cache
+        assert "default" in ctx._store_cache

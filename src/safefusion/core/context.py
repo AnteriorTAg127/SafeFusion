@@ -57,11 +57,12 @@ from ..engines.image_pipeline import WhitelistMatcher
 from ..engines.keyword_engine import KeywordEngine
 from ..engines.light_model import LightTextModel
 from ..engines.llm_client import LLMClient
+from ..engines.llm_client import build_llm as build_llm_client
 from ..engines.model_repo import resolve_hf_cache_dir
-from ..engines.semantic import SemanticEngine
+from ..engines.semantic import SemanticEngine, build_semantic_thresholds
 from ..logging_setup import get_logger
 from ..storage.database import Database
-from ..storage.vector_store import NumpyVectorStore
+from .stores import StoreRegistry
 
 if TYPE_CHECKING:
     from ..config import AppConfig
@@ -138,6 +139,8 @@ class AppContext:
     config: "AppConfig | None" = None
     database: "Database | None" = None
     store: "BaseVectorStore | None" = None
+    #: 多向量库注册表（P7 拆出）：路径登记 + 懒加载 + LRU（线程安全）
+    _stores: "StoreRegistry" = field(default_factory=StoreRegistry, repr=False)
     embedding: "BaseEmbedding | None" = None
     keyword_engine: "KeywordEngine | None" = None
     light_model: "LightTextModel | None" = None
@@ -238,18 +241,41 @@ class AppContext:
         else:
             _mark(degraded, "whitelist")
 
-        # ⑦ 自研向量库：有持久化文件则 load，否则空库（save 确保目录存在）
-        store: BaseVectorStore | None = None
-        try:
-            vectors_dir = data_dir / "vectors"
-            if (vectors_dir / "black.npz").is_file() or (vectors_dir / "white.npz").is_file():
-                store = NumpyVectorStore.load(str(vectors_dir))
+        # ⑦ 自研向量库：支持多库（PRD v0.4.0 M1.6）
+        # 启动只记录 name -> 目录映射，**不加载任何库文件**（避免多个大库常驻内存）。
+        # 实际加载由 get_store()/ensure_current_store() 按需懒加载 + LRU 缓存。
+        default_store_dir = data_dir / "vectors"
+        store_paths: dict[str, Path] = {"default": default_store_dir}
+        for vs_cfg in config.embedding.vector_stores:
+            candidate_dir = data_dir / str(vs_cfg.path)
+            # 兼容旧库 / 自动迁移规范化：若配置的向量库目录不存在或为空，
+            # 且旧默认库存在，则直接复用旧库路径（不复制大文件，避免重复构建）。
+            has_old_default = (default_store_dir / "black.npz").is_file() or (
+                default_store_dir / "white.npz"
+            ).is_file()
+            has_own_data = (candidate_dir / "black.npz").is_file() or (
+                candidate_dir / "white.npz"
+            ).is_file()
+            if has_old_default and not has_own_data:
+                _logger.warning(
+                    "向量库 %s 目录 %s 无数据，自动复用已有默认库 %s（不复制文件）",
+                    vs_cfg.name,
+                    candidate_dir,
+                    default_store_dir,
+                )
+                store_paths[vs_cfg.name] = default_store_dir
             else:
-                store = NumpyVectorStore(str(vectors_dir))
-                store.save()  # 空库也确保 save 目录存在
-        except Exception as exc:
-            _logger.warning("NumpyVectorStore 装配失败（降级为 None）: %s", exc)
-            _mark(degraded, "store")
+                store_paths[vs_cfg.name] = candidate_dir
+
+        # 当前 provider 对应的向量库名称：provider 配置了 vector_store 则用该库，
+        # 否则用默认库。
+        store_name: str | None = None
+        active_provider = cls._resolve_active_embedding_provider(config)
+        if active_provider is not None and active_provider.get("vector_store"):
+            store_name = str(active_provider["vector_store"])
+        if store_name is None:
+            store_name = "default"
+        store: BaseVectorStore | None = None  # 懒加载，初始不装配
 
         # ⑥ Embedding 懒加载（PRD v0.3.0 M6 D1）：build **不实例化**模型
         # （不触网 / 不装载 / 不下载），仅保存建造参数；语义引擎以 lazy
@@ -265,10 +291,11 @@ class AppContext:
         semantic: SemanticEngine | None = None
         _mark(degraded, "semantic")
 
-        # ⑨ LLM 兜底客户端（密钥仅环境变量，缺失 → available=False）
+        # ⑨ LLM 兜底客户端（密钥仅环境变量，缺失 → available=False；PRD v0.4.0
+        # 支持多 provider 自动切换）
         llm: LLMClient | None = None
         try:
-            llm = LLMClient(config.llm.model_dump(exclude={"api_key"}))
+            llm = build_llm_client(config.llm)
         except Exception as exc:
             _logger.warning("LLMClient 装配失败（降级为 None）: %s", exc)
             llm = None
@@ -279,6 +306,7 @@ class AppContext:
             config=config,
             database=database,
             store=store,
+            _stores=StoreRegistry(store_paths, store_name),
             embedding=embedding,
             keyword_engine=keyword_engine,
             light_model=light_model,
@@ -290,6 +318,57 @@ class AppContext:
         )
         ctx._embedding_spec = embedding_spec
         return ctx
+
+    # ------------------------------------------- 多向量库懒加载（PRD v0.4.0 M1.6）
+
+    @property
+    def store_paths(self) -> dict[str, Path]:
+        """``name -> 持久化目录`` 映射（委托 :class:`StoreRegistry`）。"""
+        return self._stores.paths
+
+    @property
+    def store_name(self) -> str:
+        """当前生效向量库名称（委托 :class:`StoreRegistry`）。"""
+        return self._stores.name
+
+    @store_name.setter
+    def store_name(self, value: str) -> None:
+        self._stores.name = value
+
+    @property
+    def _store_cache(self) -> dict[str, "BaseVectorStore"]:
+        """向量库 LRU 缓存（委托 :class:`StoreRegistry`；保留旧名供测试/观测）。"""
+        return self._stores.cache
+
+    def get_store(self, name: str | None = None) -> "BaseVectorStore | None":
+        """按名称懒加载向量库（委托 :class:`StoreRegistry`，LRU 读写线程安全）。"""
+        return self._stores.get(name)
+
+    def ensure_current_store(self) -> "BaseVectorStore | None":
+        """确保当前 provider 对应的向量库已加载，并返回实例。"""
+        store = self._stores.get()
+        if store is not None:
+            self.store = store
+        return store
+
+    @staticmethod
+    def _resolve_active_embedding_provider(config: "AppConfig") -> dict[str, Any] | None:
+        """返回当前生效的 embedding provider（dict 形态）；无 providers 时返回 None。
+
+        若配置了 ``active_provider`` 则优先使用该名称；否则按 priority 取最小。
+        """
+        providers = config.embedding.providers
+        if not providers:
+            return None
+        active = config.embedding.active_provider
+        if active is not None:
+            for p in providers:
+                if p.name == active:
+                    return p.model_dump()
+        return min(
+            (p.model_dump() for p in providers),
+            key=lambda p: int(p.get("priority", 1)),
+        )
 
     # ------------------------------------------- 懒装配（PRD v0.3.0 M6 D1）
 
@@ -521,12 +600,18 @@ class AppContext:
                 self._assembly_attempted = True
             return {"status": "failed", "reason": code, "message": message}
 
-        store = self.store
+        # 多向量库：懒加载当前 provider 对应的库（PRD v0.4.0 M1.6）
+        store = self.ensure_current_store()
         semantic: SemanticEngine | None = None
         if store is not None:
             try:
                 thresholds = self._current_semantic_thresholds()
-                semantic = SemanticEngine(backend, store, thresholds=thresholds)
+                semantic = SemanticEngine(
+                    backend,
+                    store,
+                    thresholds=thresholds,
+                    rerank_config=self.config.rerank if self.config is not None else None,
+                )
             except Exception as exc:
                 _logger.warning(
                     "SemanticEngine 装配失败（embedding 已就绪但语义层保持降级）: %s", exc
@@ -586,17 +671,11 @@ class AppContext:
         return code, message
 
     def _current_semantic_thresholds(self) -> dict[str, Any]:
-        """按当前有效配置合并语义引擎阈值字典（与 reload_semantic_thresholds 同口径）。"""
+        """按当前有效配置合并语义引擎阈值字典（单一来源 ``build_semantic_thresholds``）。"""
 
-        merged = dict(SemanticEngine._DEFAULT_THRESHOLDS)
-        if self.config is not None:
-            merged.update(self.config.thresholds.model_dump())
-            merged.update(self.config.semantic.model_dump())
-            weights = dict(SemanticEngine._DEFAULT_THRESHOLDS["weights"])
-            if isinstance(merged.get("weights"), dict):
-                weights.update(merged["weights"])
-            merged["weights"] = weights
-        return merged
+        if self.config is None:
+            return dict(SemanticEngine._DEFAULT_THRESHOLDS)
+        return build_semantic_thresholds(self.config)
 
     # ------------------------------------------- 热重载（PRD v0.2 M4，免重启）
 
@@ -685,6 +764,9 @@ class AppContext:
                 setattr(self, name, instance)
                 replaced.append(name)
                 _best_effort_close(old, name)
+            # 多向量库：store 替换时同步 LRU 缓存，保持 name -> instance 一致
+            if "store" in replaced and self.store_name is not None:
+                self._stores.register(self.store_name, self.store)
             # v0.3.0 M6 懒装配一致性：embedding 被替换（热应用）时刷新建造参数，
             # 作废在飞装配（代际计数）并重置失败标记（新配置可再懒装配）
             if "embedding" in replaced:
@@ -708,14 +790,8 @@ class AppContext:
         sem = self.semantic
         if sem is None or self.config is None:
             return
-        merged = dict(SemanticEngine._DEFAULT_THRESHOLDS)
-        merged.update(self.config.thresholds.model_dump())
-        merged.update(self.config.semantic.model_dump())
-        weights = dict(SemanticEngine._DEFAULT_THRESHOLDS["weights"])
-        if isinstance(merged.get("weights"), dict):
-            weights.update(merged["weights"])
-        merged["weights"] = weights
-        sem.thresholds = merged  # 单字典赋值 = 原子替换（GIL 下读者见完整快照）
+        # 单字典赋值 = 原子替换（GIL 下读者见完整快照）；合并口径单一来源
+        sem.thresholds = build_semantic_thresholds(self.config)
 
     def _refresh_degraded(self, names: list[str]) -> None:
         """按被替换组件刷新 ``degraded`` 清单（只处理本次涉及的组件名）。"""

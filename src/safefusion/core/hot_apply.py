@@ -29,33 +29,61 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from safefusion.cache.caches import CacheLayer
 from safefusion.engines.embedding import get_embedding_backend
 from safefusion.engines.light_model import LightTextModel
-from safefusion.engines.llm_client import LLMClient
-from safefusion.engines.semantic import SemanticEngine
+from safefusion.engines.llm_client import build_llm as build_llm_client
+from safefusion.engines.semantic import SemanticEngine, build_semantic_thresholds
 
 if TYPE_CHECKING:
     from safefusion.config import AppConfig
 
 _logger = logging.getLogger("safefusion.hot_apply")
 
+#: 分组应用方式（GROUP_REGISTRY 的取值）
+KIND_PARAM = "param"
+KIND_REBUILD = "rebuild"
+KIND_CONFIG_ONLY = "config_only"
+
+#: **分组分类的唯一来源**（Brooks-Lint P6）：新增配置分组只在此登记一次；
+#: 三个下游集合与 stage_apply / post_apply_sync 的分发均由其派生，避免"漏登记即静默不生效"。
+#:   - param：直接改配置叶子 + 轻量后置同步（无实例重建）
+#:   - rebuild：试建造新实例 + 锁内原子替换（rerank 本身不持实例，但改变语义引擎重排后端）
+#:   - config_only：仅同步配置叶子（server 网络绑定 / logging handler 重建下次启动生效）
+GROUP_REGISTRY: dict[str, str] = {
+    "thresholds": KIND_PARAM,
+    "semantic": KIND_PARAM,
+    "review": KIND_PARAM,
+    "keyword": KIND_PARAM,
+    "image": KIND_PARAM,
+    "embedding": KIND_REBUILD,
+    "llm": KIND_REBUILD,
+    "rerank": KIND_REBUILD,
+    "light_model": KIND_REBUILD,
+    "cache": KIND_REBUILD,
+    "server": KIND_CONFIG_ONLY,
+    "logging": KIND_CONFIG_ONLY,
+}
+
 #: 参数类分组：直接改配置叶子 + 轻量后置同步（无实例重建）
-PARAM_GROUPS = frozenset({"thresholds", "semantic", "review", "keyword", "image"})
+PARAM_GROUPS = frozenset(g for g, k in GROUP_REGISTRY.items() if k == KIND_PARAM)
 
 #: 组件重建类分组：试建造新实例 + 锁内原子替换
-REBUILD_GROUPS = frozenset({"embedding", "llm", "light_model", "cache"})
+REBUILD_GROUPS = frozenset(g for g, k in GROUP_REGISTRY.items() if k == KIND_REBUILD)
 
 #: 纯配置分组：仅同步配置叶子，不作运行时组件替换或同步
-#: （server 网络绑定 / logging handler 重建不在此里程碑热切，响应标注
-#:  ``apply_scope="config"``；绑定类变更在下次启动生效）
-CONFIG_ONLY_GROUPS = frozenset({"server", "logging"})
+CONFIG_ONLY_GROUPS = frozenset(g for g, k in GROUP_REGISTRY.items() if k == KIND_CONFIG_ONLY)
 
 __all__ = [
     "CONFIG_ONLY_GROUPS",
+    "GROUP_REGISTRY",
+    "KIND_CONFIG_ONLY",
+    "KIND_PARAM",
+    "KIND_REBUILD",
     "PARAM_GROUPS",
     "REBUILD_GROUPS",
     "StagedSwap",
@@ -83,10 +111,14 @@ def build_embedding(cfg: AppConfig) -> Any:
     return get_embedding_backend(cfg.embedding, local_files_only=True)
 
 
-def build_llm(cfg: AppConfig) -> LLMClient:
-    """按候选配置建造 LLM 客户端（密钥字段剥离走环境变量）。"""
+def build_llm(cfg: AppConfig) -> Any:
+    """按候选配置建造 LLM 客户端（PRD v0.4.0 M1/M3：支持单后端或多 provider）。
 
-    return LLMClient(cfg.llm.model_dump(exclude={"api_key"}))
+    返回 ``LLMClient`` 或 ``MultiLLM``（两者均提供 ``available`` 与
+    ``async judge(...)``）。
+    """
+
+    return build_llm_client(cfg.llm)
 
 
 def build_light_model(cfg: AppConfig) -> LightTextModel:
@@ -101,17 +133,56 @@ def build_cache(cfg: AppConfig) -> CacheLayer:
     return CacheLayer(cfg.cache.model_dump())
 
 
-def _build_semantic(ctx: Any, cfg: AppConfig, embedding: Any) -> SemanticEngine | None:
-    """按「新 embedding + 现有 store + 候选阈值」重建语义引擎。
+def _build_semantic(
+    ctx: Any, cfg: AppConfig, embedding: Any, store: Any | None
+) -> SemanticEngine | None:
+    """按「新 embedding + 指定 store + 候选阈值」重建语义引擎。
 
-    阈值合并口径与 ``AppContext.build`` / ``reload_semantic_thresholds`` 一致；
-    store 或 embedding 缺失时返回 None（语义层保持降级）。
+    阈值合并口径与装配（``AppContext``）/ 热重载一致——统一走
+    :func:`~safefusion.engines.semantic.build_semantic_thresholds`（单一来源）。
+
+    Args:
+        ctx: ``AppContext`` 实例（当前实现未直接使用，保留以统一签名）。
+        cfg: 候选有效配置（提供 thresholds / semantic / rerank 分组）。
+        embedding: 新 Embedding 后端；为 None 时不重建。
+        store: 目标向量库实例；为 None 时不重建（语义层保持降级）。
+
+    Returns:
+        重建后的 ``SemanticEngine``；``embedding`` 或 ``store`` 缺失时返回 None。
     """
 
-    if embedding is None or ctx.store is None:
+    if embedding is None or store is None:
         return None
-    thresholds = {**cfg.thresholds.model_dump(), **cfg.semantic.model_dump()}
-    return SemanticEngine(embedding, ctx.store, thresholds=thresholds)
+    return SemanticEngine(
+        embedding,
+        store,
+        thresholds=build_semantic_thresholds(cfg),
+        rerank_config=cfg.rerank,
+    )
+
+
+def _resolve_store_name_for_candidate(candidate: AppConfig) -> str | None:
+    """按候选配置解析当前 embedding provider 对应的向量库名称。"""
+    providers = candidate.embedding.providers
+    if not providers:
+        return "default"
+    active = candidate.embedding.active_provider
+    if active is not None:
+        for p in providers:
+            if p.name == active:
+                return p.vector_store or "default"
+    return min(providers, key=lambda p: p.priority).vector_store or "default"
+
+
+def _resolve_store_for_candidate(ctx: Any, candidate: AppConfig) -> Any | None:
+    """按候选配置取当前 provider 对应的向量库实例（懒加载，不常驻）。"""
+    name = _resolve_store_name_for_candidate(candidate)
+    if name is None:
+        return None
+    getter = getattr(ctx, "get_store", None)
+    if callable(getter):
+        return getter(name)
+    return None
 
 
 # ------------------------------------------------------------- 试建造 / 应用
@@ -138,11 +209,65 @@ class StagedSwap:
         return list(self.replacements)
 
 
+def _stage_embedding(ctx: Any, candidate: AppConfig) -> StagedSwap:
+    """embedding：新后端 + 按 provider 解析的向量库 + 重建语义引擎。"""
+    new_embedding = build_embedding(candidate)
+    # 多向量库：按候选配置解析当前 provider 对应的 store
+    new_store = _resolve_store_for_candidate(ctx, candidate)
+    new_semantic = _build_semantic(ctx, candidate, new_embedding, new_store)
+    replacements: dict[str, Any] = {"embedding": new_embedding}
+    if new_store is not None:
+        replacements["store"] = new_store
+        replacements["store_name"] = _resolve_store_name_for_candidate(candidate)
+    if new_semantic is not None or ctx.semantic is not None:
+        replacements["semantic"] = new_semantic
+    return StagedSwap("embedding", replacements)
+
+
+def _stage_llm(_ctx: Any, candidate: AppConfig) -> StagedSwap:
+    """llm：新建单客户端或多 provider 包装。"""
+    return StagedSwap("llm", {"llm": build_llm(candidate)})
+
+
+def _stage_rerank(ctx: Any, candidate: AppConfig) -> StagedSwap | None:
+    """rerank：只影响语义引擎的重排后端；语义引擎未装配时无需替换。"""
+    new_semantic = _build_semantic(ctx, candidate, ctx.embedding, ctx.store)
+    if new_semantic is None and ctx.semantic is None:
+        return None
+    return StagedSwap("rerank", {"semantic": new_semantic})
+
+
+def _stage_light_model(ctx: Any, candidate: AppConfig) -> StagedSwap | None:
+    """light_model：新实例；旧实例本就是 disabled 时无需替换。"""
+    new_light = build_light_model(candidate)
+    if not new_light.disabled or ctx.light_model is not None:
+        return StagedSwap("light_model", {"light_model": new_light})
+    return None
+
+
+def _stage_cache(_ctx: Any, candidate: AppConfig) -> StagedSwap:
+    """cache：新建缓存层（容量 / TTL / backend 热生效；旧缓存内容清空）。"""
+    return StagedSwap("cache", {"cache_layer": build_cache(candidate)})
+
+
+#: 重建类分组 → 试建造器（必须在 :data:`GROUP_REGISTRY` 中登记为 ``rebuild``）
+REBUILD_APPLIERS: dict[str, Callable[[Any, AppConfig], StagedSwap | None]] = {
+    "embedding": _stage_embedding,
+    "llm": _stage_llm,
+    "rerank": _stage_rerank,
+    "light_model": _stage_light_model,
+    "cache": _stage_cache,
+}
+
+
 def stage_apply(ctx: Any, group: str, candidate: AppConfig) -> StagedSwap | None:
     """对重建类分组做**试建造**（锁外执行，不触碰运行中实例）。
 
     任一建造失败（构造抛异常）直接上抛——管理端据此返回 500 并**不落库**，
     旧实例继续生效（PRD「先验证后落库、失败自动回滚旧实例」）。
+
+    分发经 :data:`REBUILD_APPLIERS`（与 :data:`GROUP_REGISTRY` 同源的声明式表），
+    不再使用 if/elif 字符串链——新增重建类分组只需补一行登记。
 
     Args:
         ctx: ``AppContext`` 实例。
@@ -153,23 +278,8 @@ def stage_apply(ctx: Any, group: str, candidate: AppConfig) -> StagedSwap | None
         ``StagedSwap``；参数类 / 纯配置分组返回 None（无需预建造）。
     """
 
-    if group == "embedding":
-        new_embedding = build_embedding(candidate)
-        new_semantic = _build_semantic(ctx, candidate, new_embedding)
-        replacements: dict[str, Any] = {"embedding": new_embedding}
-        if new_semantic is not None or ctx.semantic is not None:
-            replacements["semantic"] = new_semantic
-        return StagedSwap(group, replacements)
-    if group == "llm":
-        return StagedSwap(group, {"llm": build_llm(candidate)})
-    if group == "light_model":
-        new_light = build_light_model(candidate)
-        if not new_light.disabled or ctx.light_model is not None:
-            return StagedSwap(group, {"light_model": new_light})
-        return None  # 旧实例本就是 disabled：无需替换
-    if group == "cache":
-        return StagedSwap(group, {"cache_layer": build_cache(candidate)})
-    return None
+    applier = REBUILD_APPLIERS.get(group)
+    return applier(ctx, candidate) if applier is not None else None
 
 
 def apply_hot(
@@ -206,17 +316,36 @@ def apply_hot(
     return "config" if group in CONFIG_ONLY_GROUPS else "runtime"
 
 
+def _sync_semantic_thresholds(ctx: Any) -> None:
+    """按当前有效配置重建语义引擎阈值字典（热生效）。"""
+    ctx.reload_semantic_thresholds()
+
+
+def _sync_keywords(ctx: Any) -> None:
+    """词库 + 正则规则热重载（规则开关即时生效）。"""
+    ctx.reload_keywords()
+
+
+#: 参数类分组 → 组后置同步（声明式表，与 GROUP_REGISTRY 同源）
+POST_APPLIERS: dict[str, Callable[[Any], None]] = {
+    "thresholds": _sync_semantic_thresholds,
+    "semantic": _sync_semantic_thresholds,
+    "keyword": _sync_keywords,
+}
+
+
 def post_apply_sync(ctx: Any, group: str) -> None:
     """参数类分组的运行时后置同步（轻量，不重建实例）。
 
     - thresholds / semantic：按当前有效配置重建语义引擎阈值字典；
     - keyword：词库 + 正则规则重载（规则开关即时生效）。
+
+    分发经 :data:`POST_APPLIERS`；未登记的分组无后置同步（空操作）。
     """
 
-    if group in ("thresholds", "semantic"):
-        ctx.reload_semantic_thresholds()
-    elif group == "keyword":
-        ctx.reload_keywords()
+    applier = POST_APPLIERS.get(group)
+    if applier is not None:
+        applier(ctx)
 
 
 def apply_admin_token(token_store: Any, new_token: str) -> None:
