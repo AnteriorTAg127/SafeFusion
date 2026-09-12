@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safefusion"
-version = "0.1.0"
+version = "0.4.0"
 description = "SafeFusion —— 语义检索 + 关键词规则双通道融合的多模态违规内容识别引擎"
 readme = "README.md"
 requires-python = ">=3.10"
