@@ -37,6 +37,13 @@ import httpx
 import numpy as np
 from PIL import Image
 
+from safefusion.engines.failover import (
+    AllProvidersFailed,
+    FailoverCircuit,
+    ProviderError,
+    call_with_failover,
+)
+
 _logger = logging.getLogger("safefusion.engines.embedding")
 
 #: 云端输入图像的 MIME 类型映射（Pillow 格式名 → data URI MIME）
@@ -249,6 +256,12 @@ class CloudEmbeddingAPI(BaseEmbedding):
       llama-server ``--embeddings``）通常无鉴权；置 True 时 Key 缺失不抛异常，
       请求不带 Authorization 头（仅限内网信任环境）。默认为 False 保留云端强制
       Key 的安全语义。
+    - ``image_protocol``：``openai``（默认）| ``llamacpp``。``openai`` 图片走
+      OpenAI 兼容 ``/v1/embeddings`` + ``input`` + data URI；``llamacpp`` 图片走
+      llama.cpp 多模态专用 ``/embeddings`` + ``content`` + ``{prompt_string,
+      multimodal_data}``，``prompt_string`` 中的媒体占位符从 ``/props`` 动态获取
+      ``media_marker``（每次启动可能随机变化）。纯文本编码始终走 OpenAI 风格。
+    - ``image_max_side`` / ``image_quality``：图片发送前缩放/压缩参数。
 
     图像 base64 编码在内存进行（Pillow BytesIO），不入盘、不写日志。
     """
@@ -278,6 +291,19 @@ class CloudEmbeddingAPI(BaseEmbedding):
         timeout_ms = float(cloud.get("timeout", _DEFAULT_CLOUD_TIMEOUT))
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._client = httpx.Client(timeout=timeout_ms, headers=headers)
+        #: 图片发送前最长边缩放上限（0 不缩放）；防止大图在 llama.cpp 视觉
+        #: tokenizer 中展开为数十万 token（PRD v0.4.0 M5 修复）
+        self._image_max_side = int(cloud.get("image_max_side", 1024) or 0)
+        self._image_quality = int(cloud.get("image_quality", 85) or 85)
+        #: 图片协议：openai（默认）| llamacpp（llama.cpp 多模态专用）
+        self._image_protocol = str(cloud.get("image_protocol", "openai") or "openai").lower()
+        if self._image_protocol not in ("openai", "llamacpp"):
+            raise ValueError(
+                f"未知 embedding.cloud.image_protocol: {self._image_protocol!r}"
+                "（可选 openai / llamacpp）"
+            )
+        #: llama.cpp 媒体占位符（仅 llamacpp 协议，从 /props 动态获取）
+        self._media_marker: str | None = None
         #: 云端输出维度未知，首次编码后记录（空输入时不可用）
         self._output_dim: int | None = None
 
@@ -293,19 +319,64 @@ class CloudEmbeddingAPI(BaseEmbedding):
             api_key = os.environ.get(_STANDARD_KEY_ENV)
         return api_key or None
 
-    @staticmethod
-    def _image_to_data_uri(image: Image.Image) -> str:
-        """将 PIL 图像转为 base64 data URI 字符串（内存 BytesIO，不落盘）。"""
-        fmt = (image.format or "PNG").upper()
-        save_fmt = fmt if fmt in _FORMAT_TO_MIME else "PNG"
-        mime = _FORMAT_TO_MIME.get(save_fmt, "image/png")
-        buf = io.BytesIO()
-        image.save(buf, format=save_fmt)
-        payload = base64.b64encode(buf.getvalue()).decode("ascii")
-        return f"data:{mime};base64,{payload}"
+    def _prepare_image(self, image: Image.Image) -> Image.Image:
+        """按 ``image_max_side`` 缩放最长边并转 RGB（供两种协议共用）。"""
+        img = image
+        max_side = self._image_max_side
+        if max_side > 0:
+            w, h = img.size
+            longer = max(w, h)
+            if longer > max_side:
+                scale = max_side / longer
+                new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+        return img.convert("RGB") if img.mode != "RGB" else img
 
-    def _encode(self, inputs: list[str]) -> np.ndarray:
-        """发起一次 /embeddings 请求并返回 L2 归一化向量矩阵（按 index 排序）。"""
+    def _image_to_data_uri(self, image: Image.Image) -> str:
+        """将 PIL 图像转为 base64 data URI 字符串（内存 BytesIO，不落盘）。
+
+        发送前按 ``image_max_side`` 缩放最长边、统一转 JPEG 压缩，避免大图在
+        llama.cpp 视觉 tokenizer 中展开为数十万 token（PRD v0.4.0 M5 修复）。
+        """
+        rgb = self._prepare_image(image)
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=max(1, min(95, self._image_quality)))
+        payload = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{payload}"
+
+    def _image_to_plain_base64(self, image: Image.Image) -> str:
+        """将 PIL 图像转为纯 base64（不带 data URI 前缀），供 llamacpp 协议。"""
+        rgb = self._prepare_image(image)
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=max(1, min(95, self._image_quality)))
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _get_media_marker(self) -> str:
+        """从 ``/props`` 获取 llama.cpp 当前媒体占位符（每次启动可能变化）。
+
+        llama.cpp 多模态请求要求 ``prompt_string`` 中的占位符与 ``/props``
+        返回的 ``media_marker`` 一致，写死 ``<__media__>`` 会失败。
+
+        ``/props`` 位于 llama.cpp 根路径（不带 ``/v1``），而 ``base_url`` 可能
+        是 ``http://host:port/v1``。这里把 ``/v1`` 后缀去掉再请求根 ``/props``。
+        """
+        if self._media_marker is not None:
+            return self._media_marker
+        props_url = self.base_url
+        if props_url.endswith("/v1"):
+            props_url = props_url[:-3] or props_url
+        resp = self._client.get(f"{props_url}/props")
+        resp.raise_for_status()
+        marker = resp.json().get("media_marker")
+        if not marker:
+            raise RuntimeError(
+                "llama.cpp 服务 /props 未返回 media_marker，无法构造多模态 embedding 请求"
+            )
+        self._media_marker = str(marker)
+        return self._media_marker
+
+    def _encode_openai(self, inputs: list[str]) -> np.ndarray:
+        """OpenAI 风格 /v1/embeddings：input 数组，embedding 为一维向量。"""
         payload: dict[str, Any] = {"model": self.model, "input": inputs}
         resp = self._client.post(f"{self.base_url}/embeddings", json=payload)
         resp.raise_for_status()
@@ -316,21 +387,143 @@ class CloudEmbeddingAPI(BaseEmbedding):
         self._output_dim = int(vectors.shape[1])
         return vectors
 
+    def _encode_llamacpp(self, images: list[Image.Image]) -> np.ndarray:
+        """llama.cpp 多模态 /embeddings：content 数组 + multimodal_data。
+
+        响应为 ``[{"index":0, "embedding": [[...]]}]``（embedding 是二维数组，
+        形状 ``(1, d)``），需按 index 排序并展平为 ``(n, d)`` 矩阵。
+        """
+        marker = self._get_media_marker()
+        content: list[dict[str, Any]] = []
+        for image in images:
+            b64 = self._image_to_plain_base64(image)
+            content.append(
+                {
+                    "prompt_string": f"<|startoftext|>描述图片：{marker}\n",
+                    "multimodal_data": [b64],
+                }
+            )
+        payload: dict[str, Any] = {"content": content}
+        # llama.cpp 多模态专用端点位于根路径 /embeddings（OAI /v1/embeddings
+        # 对 content 数组支持不完整，实测 /embeddings 才可用）。
+        embeddings_url = self.base_url
+        if embeddings_url.endswith("/v1"):
+            embeddings_url = embeddings_url[:-3] or embeddings_url
+        resp = self._client.post(f"{embeddings_url}/embeddings", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"llama.cpp /embeddings 响应格式非法：期望数组，实际 {type(data).__name__}"
+            )
+        items = sorted(data, key=lambda item: int(item.get("index", 0)))
+        vectors_list: list[np.ndarray] = []
+        for item in items:
+            emb = item.get("embedding")
+            arr = np.asarray(emb, dtype=np.float32)
+            # llama.cpp 多模态返回 (1, d)，OpenAI 返回 (d,)，统一展平成 (d,)
+            if arr.ndim == 2 and arr.shape[0] == 1:
+                arr = arr[0]
+            vectors_list.append(arr)
+        if not vectors_list:
+            return np.zeros((0, 0), dtype=np.float32)
+        matrix = np.stack(vectors_list, axis=0)
+        vectors = _l2_rows(matrix)
+        self._output_dim = int(vectors.shape[1])
+        return vectors
+
     def encode_texts(self, texts: list[str]) -> np.ndarray:
-        """编码文本列表，返回形状 ``(n, d)`` 的 L2 归一化向量矩阵。"""
+        """编码文本列表，返回形状 ``(n, d)`` 的 L2 归一化向量矩阵。
+
+        纯文本始终走 OpenAI 兼容协议（llama.cpp 也兼容该路径）。
+        """
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
-        return self._encode(texts)
+        return self._encode_openai(texts)
 
     def encode_images(self, images: list[Image.Image]) -> np.ndarray:
-        """编码图片列表（转 base64 data URI），返回 ``(n, d)`` 归一化矩阵。"""
+        """编码图片列表，返回 ``(n, d)`` 归一化矩阵。
+
+        - ``image_protocol=openai``：转 data URI 后走 OpenAI 兼容 ``input``；
+        - ``image_protocol=llamacpp``：转纯 base64 后走 llama.cpp 多模态
+          ``content`` + ``multimodal_data``。
+        """
         if not images:
             return np.zeros((0, 0), dtype=np.float32)
-        return self._encode([self._image_to_data_uri(image) for image in images])
+        if self._image_protocol == "llamacpp":
+            return self._encode_llamacpp(images)
+        uris = []
+        for image in images:
+            uri = self._image_to_data_uri(image)
+            uris.append(uri)
+            _logger.debug(
+                "云端 Embedding 图片编码（openai 协议）：原始尺寸=%s，base64 长度=%d，max_side=%s",
+                image.size,
+                len(uri),
+                self._image_max_side,
+            )
+        return self._encode_openai(uris)
 
     def close(self) -> None:
         """关闭底层 httpx 客户端连接。"""
         self._client.close()
+
+
+class MultiEmbedding(BaseEmbedding):
+    """多提供者 Embedding 后端（PRD v0.4.0 M3）。
+
+    按优先级顺序调用多个 ``BaseEmbedding`` 提供者；单个提供者编码异常时
+    记录熔断并切换下一个；全部失败上抛最后异常（由语义层按既有降级处理）。
+
+    Args:
+        providers: ``(name, priority, embedding, failover)`` 提供者列表。
+        active_provider: 手动指定首选提供者名称；配置后该提供者优先于
+            ``priority`` 被首先尝试，其余仍按 priority 顺序作为后备。
+    """
+
+    supports_mixed_input = False
+
+    def __init__(
+        self,
+        providers: list[tuple[str, int, BaseEmbedding, FailoverCircuit]],
+        active_provider: str | None = None,
+    ) -> None:
+        self._providers = providers
+        self._active = active_provider
+
+    def _encode(self, method: str, inputs: Any) -> np.ndarray:
+        try:
+            return call_with_failover(
+                self._providers,
+                lambda backend: getattr(backend, method)(inputs),
+                active=self._active,
+                logger=_logger,
+                label="Embedding 提供者",
+            )
+        except AllProvidersFailed as exc:
+            raise ProviderError("所有 Embedding 提供者均不可用") from exc.__cause__
+
+    def encode_texts(self, texts: list[str]) -> np.ndarray:
+        """按提供者顺序编码文本；全部失败抛 ProviderError。"""
+        if not texts:
+            return np.zeros((0, 0), dtype=np.float32)
+        return self._encode("encode_texts", texts)
+
+    def encode_images(self, images: list[Image.Image]) -> np.ndarray:
+        """按提供者顺序编码图片；全部失败抛 ProviderError。"""
+        if not images:
+            return np.zeros((0, 0), dtype=np.float32)
+        return self._encode("encode_images", images)
+
+    def close(self) -> None:
+        """关闭全部提供者底层资源（尽力而为，失败仅告警）。"""
+        for name, _priority, backend, _circuit in self._providers:
+            closer = getattr(backend, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as exc:
+                    _logger.warning("Embedding 提供者 %s 关闭失败: %s", name, exc)
 
 
 def get_embedding_backend(
@@ -358,6 +551,33 @@ def get_embedding_backend(
         ValueError: backend 取值未知。
     """
     cfg_dict = _as_dict(cfg)
+    providers = cfg_dict.get("providers") or []
+    if providers:
+        failover_cfg = cfg_dict.get("failover") or {}
+        active = cfg_dict.get("active_provider")
+        built: list[tuple[str, int, BaseEmbedding, FailoverCircuit]] = []
+        for provider in providers:
+            provider_cfg = dict(provider)
+            # 去掉 multi-provider 元数据，只保留单后端构造所需的 local/cloud 字段
+            for key in ("name", "priority", "vector_store", "failover"):
+                provider_cfg.pop(key, None)
+            # 单 provider 内若没有显式 backend，继承总 backend（兼容旧 local/cloud 结构）
+            provider_cfg.setdefault("backend", cfg_dict.get("backend", "local"))
+            backend = get_embedding_backend(
+                provider_cfg,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+            built.append(
+                (
+                    str(provider.get("name") or f"provider-{len(built) + 1}"),
+                    int(provider.get("priority", 1)),
+                    backend,
+                    FailoverCircuit(**failover_cfg),
+                )
+            )
+        return MultiEmbedding(built, active_provider=active)
+
     backend = cfg_dict.get("backend", "local")
     if backend == "local":
         return LocalChineseCLIP(

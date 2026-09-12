@@ -31,7 +31,7 @@ try:  # T5 可能未合并：fuse_vectors 缺失时回退到本模块等价实�
 except ImportError:
     _embedding_fuse_vectors = None
 
-from safefusion.engines.rerank import get_rerank_backend
+from safefusion.engines.rerank import build_rerank_backend, get_rerank_backend
 
 _logger = logging.getLogger("safefusion.engines.semantic")
 
@@ -113,6 +113,8 @@ class SemanticEngine:
         "margin_w": 0.05,
         "black_white_gap": 0.02,
         "top_k": 5,
+        "black_top_k": None,
+        "white_top_k": None,
         "margin_norm": 0.3,
         "weights": {"w_top": 0.6, "w_margin": 0.4},
         "fuse_mode": "pool",
@@ -129,6 +131,7 @@ class SemanticEngine:
         embedding: EmbeddingBackend,
         store: VectorStoreBackend,
         thresholds: dict[str, Any] | None = None,
+        rerank_config: Any | None = None,
     ) -> None:
         """初始化语义引擎。
 
@@ -140,9 +143,13 @@ class SemanticEngine:
                 weights{ w_top, w_margin } / fuse_mode，以及 v0.2 Rerank 键
                 （键名对齐 config.semantic）：rerank_enabled /
                 rerank_w_top / rerank_w_margin / rerank_w_rerank / rerank_top_k。
+            rerank_config: 可选 ``RerankConfig`` 或同构 dict；为 None 时
+                ``rerank_enabled=True`` 仍回退本地 CLIP 重排（v0.2 兼容）。
         """
         self.embedding = embedding
         self.store = store
+        self.rerank_config = rerank_config
+        self._last_query_text: str | None = None
 
         merged = dict(self._DEFAULT_THRESHOLDS)
         if thresholds:
@@ -184,14 +191,17 @@ class SemanticEngine:
         """
         has_text = bool(text and text.strip())
         if not has_text and not frames:
-            return self._degraded(_REASON_EMPTY_INPUT)
+            return self.degraded(_REASON_EMPTY_INPUT)
 
+        # 供远程 ReRanker 使用原始 query 文本（PRD v0.4.0 M2）
+        self._last_query_text = text if has_text else None
         query = self._build_query(text, frames)
         if query is None:
-            return self._degraded(_REASON_EMBEDDING_ERROR)
+            return self.degraded(_REASON_EMBEDDING_ERROR)
 
         eff = self._effective_thresholds(ov)
-        top_k = eff["top_k"]
+        black_top_k = max(1, int(eff.get("black_top_k") or eff["top_k"]))
+        white_top_k = max(1, int(eff.get("white_top_k") or eff["top_k"]))
         semantic_threshold = eff["semantic_threshold"]
         margin_w = eff["margin_w"]
         margin_norm = eff["margin_norm"]
@@ -199,16 +209,16 @@ class SemanticEngine:
         w_margin = eff["weights"]["w_margin"]
 
         try:
-            black_hits = self.store.search(query, "black", top_k)
-            white_hits = self.store.search(query, "white", top_k)
+            black_hits = self.store.search(query, "black", black_top_k)
+            white_hits = self.store.search(query, "white", white_top_k)
         except Exception:
             _logger.exception("语义检索失败（store.search 异常），语义层降级")
-            return self._degraded(_REASON_STORE_ERROR)
+            return self.degraded(_REASON_STORE_ERROR)
 
         if not black_hits:
-            return self._degraded(_REASON_EMPTY_BLACK)
+            return self.degraded(_REASON_EMPTY_BLACK)
         if not white_hits:
-            return self._degraded(_REASON_EMPTY_WHITE)
+            return self.degraded(_REASON_EMPTY_WHITE)
 
         top_hit = max(black_hits, key=self._hit_score)
         black_top_score = float(self._hit_score(top_hit))
@@ -355,7 +365,15 @@ class SemanticEngine:
         if rerank_top_k >= 1:
             candidates = candidates[:rerank_top_k]
         try:
-            backend = get_rerank_backend(eff, self.embedding)
+            if self.rerank_config is not None:
+                backend = build_rerank_backend(self.rerank_config, eff, self.embedding)
+            else:
+                backend = get_rerank_backend(eff, self.embedding)
+            # 远程 ReRanker 需要原始 query 文本：注入候选元数据供 MultiRerank/CloudRerank 读取
+            if self._last_query_text:
+                for cand in candidates:
+                    cand["metadata"] = dict(cand.get("metadata") or {})
+                    cand["metadata"]["_query_text"] = self._last_query_text
             reranked = backend.rerank(query, candidates)
         except Exception:
             _logger.exception("Rerank 执行失败（回退三信号置信度）")
@@ -375,11 +393,16 @@ class SemanticEngine:
                 eff[key] = float(value)
             elif key in ov:
                 _logger.warning("忽略非法阈值覆盖 %s=%r", key, ov.get(key))
-        if "top_k" in ov:
-            try:
-                eff["top_k"] = max(1, int(ov["top_k"]))
-            except (TypeError, ValueError):
-                _logger.warning("忽略非法 top_k 覆盖: %r", ov.get("top_k"))
+        for key in ("top_k", "black_top_k", "white_top_k"):
+            if key in ov:
+                try:
+                    value = int(ov[key])
+                    if value >= 1:
+                        eff[key] = value
+                    else:
+                        _logger.warning("忽略非法 %s 覆盖（须>=1）: %r", key, ov.get(key))
+                except (TypeError, ValueError):
+                    _logger.warning("忽略非法 %s 覆盖: %r", key, ov.get(key))
         return eff
 
     @staticmethod
@@ -408,9 +431,13 @@ class SemanticEngine:
         value = hit.get("id") if isinstance(hit, dict) else getattr(hit, "id", None)
         return "" if value is None else str(value)
 
-    @staticmethod
-    def _degraded(reason: str) -> dict[str, Any]:
-        """降级结果：不做违规断言，reason 注明原因（编排层据此路由）。"""
+    @classmethod
+    def degraded(cls, reason: str) -> dict[str, Any]:
+        """降级结果：不做违规断言，reason 注明原因（编排层据此路由）。
+
+        唯一来源——编排层（``core.orchestrator``）复用本类方法，不再自行构造
+        同形字典（Brooks-Lint R3：Knowledge Duplication）。
+        """
         return {
             "triggered": False,
             "confidence": 0.0,
@@ -420,3 +447,21 @@ class SemanticEngine:
             "white_avg": 0.0,
             "reason": reason,
         }
+
+
+def build_semantic_thresholds(config: Any) -> dict[str, Any]:
+    """按「默认 < thresholds < semantic」合并语义引擎阈值字典（唯一来源）。
+
+    合并口径与 :class:`SemanticEngine` 构造函数一致（含嵌套 ``weights`` 合并），
+    供装配（``AppContext``）、热应用（``hot_apply``）与热重载统一调用，
+    避免在多处重复「默认值 + 分组覆盖」这一决策。
+    """
+
+    merged = dict(SemanticEngine._DEFAULT_THRESHOLDS)
+    merged.update(config.thresholds.model_dump())
+    merged.update(config.semantic.model_dump())
+    weights = dict(SemanticEngine._DEFAULT_THRESHOLDS["weights"])
+    if isinstance(merged.get("weights"), dict):
+        weights.update(merged["weights"])
+    merged["weights"] = weights
+    return merged

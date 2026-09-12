@@ -27,7 +27,14 @@ from typing import Any
 from openai import AsyncOpenAI
 from PIL import Image
 
+from safefusion.engines.failover import (
+    AllProvidersFailed,
+    FailoverCircuit,
+    call_with_failover_async,
+)
 from safefusion.logging_setup import get_logger
+
+_logger = get_logger("engines.llm_client")
 
 #: 系统提示词：内容审核员角色 + 强制 JSON 结构 + 防护指令（PRD §3.5）
 _SYSTEM_PROMPT = """你是 SafeFusion 的内容审核员，只负责对给定内容（文本/图片）做违规判定。
@@ -346,3 +353,96 @@ class LLMClient:
             cache_hint,
         )
         return None
+
+
+class MultiLLM:
+    """多提供者 LLM 客户端（PRD v0.4.0 M3）。
+
+    按优先级顺序尝试多个 ``LLMClient``；单个提供者抛异常或 ``judge`` 返回
+    None 时切换下一个；全部失败返回 None（编排层按既有 LLM 兜底回退语义层）。
+
+    Args:
+        providers: ``(name, priority, client, failover)`` 提供者列表。
+        active_provider: 手动指定首选提供者名称。
+    """
+
+    def __init__(
+        self,
+        providers: list[tuple[str, int, LLMClient, FailoverCircuit]],
+        active_provider: str | None = None,
+    ) -> None:
+        self._providers = providers
+        self._active = active_provider
+
+    @property
+    def available(self) -> bool:
+        """是否存在至少一个可用（未熔断）提供者。"""
+        return any(circuit.is_available() for _name, _prio, _client, circuit in self._providers)
+
+    async def judge(
+        self,
+        text: str | None,
+        images: list[Image.Image | str],
+        context: str | None,
+        *,
+        cache_hint: str | None = None,
+        animated: bool = False,
+    ) -> dict[str, Any] | None:
+        """依次尝试各提供者；返回首个有效判定，全部失败返回 None。"""
+        try:
+            return await call_with_failover_async(
+                self._providers,
+                lambda client: client.judge(
+                    text,
+                    images,
+                    context,
+                    cache_hint=cache_hint,
+                    animated=animated,
+                ),
+                active=self._active,
+                is_failure=lambda verdict: verdict is None,
+                logger=_logger,
+                label="LLM 提供者",
+            )
+        except AllProvidersFailed:
+            return None
+
+
+def build_llm(cfg: Any) -> "LLMClient":
+    """按 LLM 配置构造单客户端或多提供者包装（PRD v0.4.0 M1/M3）。
+
+    Args:
+        cfg: ``LLMConfig`` pydantic 模型或同构 dict。``providers`` 为空时
+            返回旧单后端 ``LLMClient``；非空时返回 ``MultiLLM``。
+
+    Returns:
+        ``LLMClient`` 或 ``MultiLLM``（两者均提供 ``available`` 与
+        ``async judge(...)`` 接口）。
+    """
+    cfg_dict = cfg.model_dump(exclude={"api_key"}) if hasattr(cfg, "model_dump") else dict(cfg)
+    cfg_dict.pop("api_key", None)
+    providers = cfg_dict.get("providers") or []
+    if not providers:
+        return LLMClient(cfg_dict)
+
+    failover_cfg = cfg_dict.get("failover") or {}
+    active = cfg_dict.get("active_provider")
+    built: list[tuple[str, int, LLMClient, FailoverCircuit]] = []
+    for provider in providers:
+        provider_cfg = dict(provider)
+        # 多 provider 元数据不传给单客户端构造
+        for key in ("name", "priority"):
+            provider_cfg.pop(key, None)
+        provider_cfg.setdefault("api_key_env", cfg_dict.get("api_key_env") or "OPENAI_API_KEY")
+        provider_cfg.setdefault("timeout", cfg_dict.get("timeout", 3.0))
+        provider_cfg.setdefault("max_retry", cfg_dict.get("max_retry", 1))
+        client = LLMClient(provider_cfg)
+        built.append(
+            (
+                str(provider.get("name") or f"provider-{len(built) + 1}"),
+                int(provider.get("priority", 1)),
+                client,
+                FailoverCircuit(**failover_cfg),
+            )
+        )
+    return MultiLLM(built, active_provider=active)

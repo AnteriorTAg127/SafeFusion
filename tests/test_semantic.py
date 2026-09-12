@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -172,8 +174,10 @@ class TestOverrideCoverage:
 
     def test_ov_top_k_bounds(self) -> None:
         eng = make_engine(black_cos=[0.9, 0.5], white_cos=[0.2, 0.2])
-        eng.audit("内容", [], {"top_k": 0})  # 拉到 1，不崩
-        assert eng.store.search_calls[-1][1] == 1
+        eng.audit("内容", [], {"top_k": 0})  # 非法 0 忽略，回到默认 5，不崩
+        assert eng.store.search_calls[-1][1] == 5
+        eng.audit("内容", [], {"top_k": 3})  # 合法覆盖生效
+        assert eng.store.search_calls[-1][1] == 3
 
 
 class TestMultiModalInputs:
@@ -482,3 +486,64 @@ class TestRerankFourSignal:
         margin = max(0.0, 0.5 - 0.2 - 0.05)
         expected = 0.5 * 0.5 + 0.3 * (margin / 0.3) + 0.2 * 0.0
         assert out["confidence"] == pytest.approx(expected, abs=1e-6)
+
+    def test_rerank_config_routes_to_build_rerank_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SemanticEngine 传入 rerank_config 时，_run_rerank 使用完整 rerank 路由。"""
+        import safefusion.engines.semantic as semantic_mod
+        from safefusion.config import RerankConfig
+
+        class _SpyBackend:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def rerank(
+                self, query_vec: np.ndarray, candidates: list[dict[str, Any]]
+            ) -> list[dict[str, Any]]:
+                self.calls += 1
+                out = []
+                for cand in candidates:
+                    item = dict(cand)
+                    item["rerank_score"] = 0.9
+                    out.append(item)
+                return out
+
+        spy = _SpyBackend()
+        monkeypatch.setattr(
+            semantic_mod,
+            "build_rerank_backend",
+            lambda rerank_cfg, semantic_cfg, embedding: spy,
+        )
+        store = FakeStore(
+            black=[Hit("b0", 0.5, {"category": "色情", "text": "近"})],
+            white=[Hit("w0", 0.2, {"category": "安全"})],
+        )
+        emb = FakeEmbedding(
+            texts={"内容": unit(0.0), "近": unit(5.0)},
+            images=np.zeros((0, 2)),
+        )
+        eng = SemanticEngine(
+            emb,
+            store,
+            {
+                "rerank_enabled": True,
+                "rerank_w_top": 0.0,
+                "rerank_w_margin": 0.0,
+                "rerank_w_rerank": 1.0,
+            },
+            rerank_config=RerankConfig(
+                providers=[
+                    {
+                        "name": "cloud-x",
+                        "type": "cloud",
+                        "base_url": "http://x",
+                        "model": "m",
+                        "allow_no_key": True,
+                    }
+                ]
+            ),
+        )
+        out = eng.audit("内容", [])
+        assert spy.calls == 1
+        assert out["rerank_black_max"] == pytest.approx(0.9, abs=1e-6)

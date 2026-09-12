@@ -169,14 +169,26 @@ class TestCloudEmbeddingApi:
             return self._payload
 
     class FakeCloudClient:
-        def __init__(self, response: TestCloudEmbeddingApi.FakeCloudResponse) -> None:
+        def __init__(
+            self,
+            response: TestCloudEmbeddingApi.FakeCloudResponse,
+            props: TestCloudEmbeddingApi.FakeCloudResponse | None = None,
+        ) -> None:
             self._response = response
+            self._props = props
             self.captured: dict[str, Any] = {}
+            self.captured_get: dict[str, Any] = {}
             self.closed = False
 
         def post(self, url: str, json: dict[str, Any] | None = None, **kwargs: Any) -> Any:
             self.captured = {"url": url, "json": json}
             return self._response
+
+        def get(self, url: str, **kwargs: Any) -> Any:
+            self.captured_get = {"url": url}
+            if self._props is None:
+                raise RuntimeError("FakeCloudClient: no props response configured")
+            return self._props
 
         def close(self) -> None:
             self.closed = True
@@ -223,7 +235,100 @@ class TestCloudEmbeddingApi:
             api.close()
         inputs = client.captured["json"]["input"]
         assert len(inputs) == 1
-        assert inputs[0].startswith("data:image/png;base64,")
+        assert inputs[0].startswith("data:image/jpeg;base64,")
+
+    def test_llamacpp_image_protocol_request_and_response(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from PIL import Image
+
+        marker = "<__media_test_marker__>"
+        props_payload = {"media_marker": marker}
+        # llama.cpp 多模态响应：embedding 为二维数组 (1, d)
+        emb_payload = [
+            {"index": 0, "embedding": [[3.0, 4.0]]},
+        ]
+        client = self.FakeCloudClient(
+            self.FakeCloudResponse(emb_payload), self.FakeCloudResponse(props_payload)
+        )
+        monkeypatch.setattr(emb_mod.httpx, "Client", lambda *a, **k: client)
+
+        api = CloudEmbeddingAPI(
+            {
+                "cloud": {
+                    "base_url": "http://llama.example",
+                    "model": "m1",
+                    "api_key": "k",
+                    "image_protocol": "llamacpp",
+                }
+            }
+        )
+        try:
+            img = Image.new("RGB", (4, 4), (255, 0, 0))
+            out = api.encode_images([img])
+        finally:
+            api.close()
+
+        # 先 GET /props 获取 marker，再 POST /embeddings
+        assert client.captured_get["url"] == "http://llama.example/props"
+        assert client.captured["url"] == "http://llama.example/embeddings"
+        content = client.captured["json"]["content"]
+        assert len(content) == 1
+        assert marker in content[0]["prompt_string"]
+        assert content[0]["multimodal_data"] == [
+            client.captured["json"]["content"][0]["multimodal_data"][0]
+        ]
+        # 纯 base64，不含 data: 前缀
+        assert not content[0]["multimodal_data"][0].startswith("data:")
+        # 响应 embedding 二维数组被展平为 (1, 2) 并 L2 归一化
+        assert out.shape == (1, 2)
+        assert np.allclose(out[0], np.array([0.6, 0.8]), atol=1e-6)
+
+    def test_llamacpp_image_protocol_uses_root_props_and_embeddings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from PIL import Image
+
+        marker = "<__media_v1_test__>"
+        props_payload = {"media_marker": marker}
+        emb_payload = [{"index": 0, "embedding": [[1.0, 0.0]]}]
+        client = self.FakeCloudClient(
+            self.FakeCloudResponse(emb_payload), self.FakeCloudResponse(props_payload)
+        )
+        monkeypatch.setattr(emb_mod.httpx, "Client", lambda *a, **k: client)
+
+        api = CloudEmbeddingAPI(
+            {
+                "cloud": {
+                    "base_url": "http://llama.example/v1",
+                    "model": "m1",
+                    "api_key": "k",
+                    "image_protocol": "llamacpp",
+                }
+            }
+        )
+        try:
+            img = Image.new("RGB", (4, 4), (255, 0, 0))
+            api.encode_images([img])
+        finally:
+            api.close()
+
+        # base_url 带 /v1 时，props 和 embeddings 都应去掉 /v1 走根路径
+        assert client.captured_get["url"] == "http://llama.example/props"
+        assert client.captured["url"] == "http://llama.example/embeddings"
+
+    def test_llamacpp_image_protocol_unknown_value(self) -> None:
+        with pytest.raises(ValueError, match="image_protocol"):
+            CloudEmbeddingAPI(
+                {
+                    "cloud": {
+                        "base_url": "http://x",
+                        "model": "m",
+                        "api_key": "k",
+                        "image_protocol": "bad",
+                    }
+                }
+            )
 
     def test_key_header_attached(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: dict[str, Any] = {}
