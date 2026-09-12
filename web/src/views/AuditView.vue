@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * 审核记录页（T24 + T41 增强）：
- * - 筛选栏：时间范围（datetime-local）、结论（全部/违规/通过）、置信度区间
- *   （min/max）、文本哈希模糊；查询 / 重置
+ * 审核记录页（T24 + T41 增强 + T57b/F7）：
+ * - 筛选栏：时间范围（datetime-local）、结论（全部/违规/通过）、来源（五值下拉）、
+ *   类别（输入框）、渠道（standard/full）、置信度区间（min/max）、文本哈希模糊；
+ *   查询 / 重置
  * - DataTable + Pagination + 空态 + loading；点击行任意单元格呼出 AppModal 查看
  *   detail_json（T41：详情由 EvidencePanel（T37 组件）分层渲染，原始 JSON 折叠
  *   由 EvidencePanel 内部承载；detail 为 null 时说明 standard 渠道不返回明细）
@@ -13,6 +14,20 @@
  *   确认并提示缩小范围（详见 exportHint 常量与 askExport）
  * - T41「⟳ 自动刷新（10s）」：开关默认关，localStorage sf_audit_autorefresh 记忆；
  *   开启后每 10 秒重拉当前页（保留筛选与页码），离开页面自动清除定时器
+ *
+ * T57b/F7（S4）服务端筛选接线（admin.py:1167-1169 query_logs / 1196-1198 export，
+ * database.py _log_where 均精确匹配）：来源（SOURCE_LABELS 五值，自 utils/format
+ * 收敛）、类别（文本输入，等值比较）、渠道 key_tier（standard/full）三参数透传
+ * /logs 查询与 /logs/export 导出；清除筛选时一并重置。客户端过滤模式（置信度/
+ * 文本哈希）保持现状不受影响。
+ *
+ * T57a/F3（C3）竞态与重入防护：
+ * - requestSeq 模块级序号守卫：每次 loadData 自增，仅最新序号的响应允许落
+ *   rows/total/clientRows（乱序响应不覆盖新结果）
+ * - 轮询重入守卫：自动刷新 tick 时若上一轮 loadData 未完成则跳过（不堆积请求）
+ * - AbortController：切页/筛选/组件卸载时取消在途请求（axios signal 透传）
+ * - 客户端过滤模式收敛到共享 fetchAllPaged（并发≤4 拉页、total 收敛即停、
+ *   maxPages=40 截断语义保留：2 万条上限近似）
  *
  * 字段对齐（依据 src/safefusion/api/admin.py query_logs + _normalize_log、
  * storage/database.py audit_logs 表）：
@@ -25,7 +40,9 @@
  *   props: { result: AuditResult | null, loading?: boolean, durationMs?: number }
  *   AuditView 把审计日志行映射为 AuditResult（auditResult computed）：
  *   request_id←row.request_id、timestamp←row.ts、has_violation←row.has_violation、
- *   confidence←row.confidence（空→0）、category←row.category、source←row.source
+ *   confidence←row.confidence（F9：透传 null，不再兜底 0——后端日志列可空，
+ *   语义降级/standard 无值时列表与详情均显示「—」，与 EvidencePanel fmtPct(null) 一致）、
+ *   category←row.category、source←row.source
  *   （窄化为 AuditSource 五值，未知兜底 semantic）、cache_hit←row.cache_hit（日志
  *   无此列→false）、detail←row.detail（解析后的 AuditDetail 或 null）。
  *   原始 JSON <details> 折叠由 EvidencePanel 内部承载（复用 JsonTree）。
@@ -38,9 +55,8 @@
  *   导出端点同样不支持这两类参数 → 导出时忽略它们并在按钮 title 注明。
  * - 结论「需人工」：audit_logs 无该状态（仅 has_violation 0/1）→ 筛选栏仅
  *   提供 全部/违规/通过，第三态留 TODO。
- * - 错误响应体为 {error}（admin.py 全局异常处理器），而 api/client.ts 的
- *   readableError 只解析 {detail} → 错误 Toast 显示通用文案（对齐问题记录
- *   TODO，本页不修改 client.ts；导出为直连 http 请求，本页内置双错误体解析）。
+ * - 错误响应体为 {error} / {detail} 双形态：client.ts errorText（F4① 收敛导出）
+ *   已兼容两种形态，本页导出路径为直连 http 也复用同一 errorText。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import DataTable from '../components/DataTable.vue'
@@ -49,7 +65,9 @@ import Pagination from '../components/Pagination.vue'
 import AppModal from '../components/AppModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import EvidencePanel from '../components/EvidencePanel.vue'
-import { apiGet, http } from '../api/client'
+import { apiGet, errorText, http } from '../api/client'
+import { fetchAllPaged } from '../utils/fetchAllPaged'
+import { fmtTime, shortHash, SOURCE_LABELS, textOf } from '../utils/format'
 import { useToastStore } from '../stores/toast'
 import type { AuditDetail, AuditResult, AuditSource } from '../api/types'
 
@@ -64,8 +82,8 @@ interface LogsPage {
 type LogRow = Record<string, unknown>
 
 const PAGE_SIZE = 20 // 分页每页条数（服务端模式与客户端模式一致）
-const ALL_PAGE_SIZE = 500 // 客户端过滤模式分批拉取页大小
-const ALL_MAX_PAGES = 40 // 客户端过滤模式页数上限（2 万条，超限截断近似）
+const ALL_PAGE_SIZE = 500 // 客户端过滤模式分批拉取页大小（对齐后端 _MAX_PAGE_SIZE）
+const ALL_MAX_PAGES = 40 // 客户端过滤模式页数上限（2 万条，超限截断近似；fetchAllPaged maxPages 语义）
 
 // ---------- 筛选状态 ----------
 const startTime = ref('') // datetime-local 原文（本地时区）
@@ -74,6 +92,11 @@ const conclusion = ref('') // '' 全部 | 'true' 违规 | 'false' 通过
 const confMin = ref('')
 const confMax = ref('')
 const textHash = ref('')
+// T57b/F7：服务端已支持的三维筛选（admin.py:1167-1169 query_logs / 1196-1198 export，
+// database.py _log_where 均为精确匹配）——来源 / 类别 / Key 分组
+const sourceFilter = ref('') // '' 全部 | AuditSource 五值之一（SOURCE_LABELS 中文展示）
+const categoryFilter = ref('') // 类别精确匹配（后端 = 等值比较，用输入框）
+const tierFilter = ref('') // '' 全部 | 'standard' | 'full'
 
 // ---------- 列表状态 ----------
 const rows = ref<LogRow[]>([])
@@ -83,6 +106,30 @@ const loading = ref(false)
 // 客户端过滤模式的中间结果（供内存分页与总条数）
 const clientRows = ref<LogRow[]>([])
 const inClientMode = ref(false)
+
+// ---------- T57a/F3：竞态守卫（requestSeq + 重入 + AbortController） ----------
+/**
+ * 请求序号守卫：每次 loadData 自增；异步响应返回时仅当序号仍为最新才落状态。
+ * 连续快切筛选/翻页时，旧序号的乱序响应被丢弃，表格与 total 始终对应最后一次操作。
+ */
+let requestSeq = 0
+/** 在途请求的取消控制器：切页/筛选/卸载时 abort（axios signal 透传） */
+let inflightController: AbortController | null = null
+
+/** 中止当前在途请求（旧序号请求立即取消，不再占带宽） */
+function abortInflight(): void {
+  inflightController?.abort()
+  inflightController = null
+}
+
+/** 新一轮 loadData：中止旧请求 + 自增序号 + 建新控制器 */
+function beginLoad(): { signal: AbortSignal; seq: number } {
+  abortInflight()
+  const controller = new AbortController()
+  inflightController = controller
+  requestSeq += 1
+  return { signal: controller.signal, seq: requestSeq }
+}
 
 // ---------- 明细弹窗 ----------
 const detailOpen = ref(false)
@@ -118,7 +165,9 @@ const auditResult = computed<AuditResult | null>(() => {
     request_id: textOf(row.request_id),
     timestamp: textOf(row.ts),
     has_violation: isViolation(row),
-    confidence: typeof row.confidence === 'number' ? row.confidence : 0,
+    // F9：不再把「空→0」兜底为数值——透传 null，列表 fmtConfidence 与详情
+    // EvidencePanel fmtPct 对 null 均显示「—」（后端日志列可空，语义降级无值）
+    confidence: typeof row.confidence === 'number' ? row.confidence : null,
     category: typeof row.category === 'string' && row.category ? row.category : null,
     source,
     cache_hit: row.cache_hit === true,
@@ -138,6 +187,8 @@ function applyAutoRefresh(enable: boolean): void {
   if (enable) {
     if (refreshTimer === undefined) {
       refreshTimer = window.setInterval(() => {
+        // 重入守卫：上一轮 loadData 未完成则跳过本轮（防请求堆积，F3）
+        if (loading.value) return
         void loadData() // 定时重拉当前页（保留筛选与页码）
       }, AUTO_REFRESH_MS)
     }
@@ -159,9 +210,9 @@ watch(autoRefresh, (enabled) => {
 // ---------- T41：CSV 导出 ----------
 /** 导出行数上限（PRD §M9 G5 语义说明；后端 /logs/export 不强制截断，前端提示性约定） */
 const EXPORT_MAX_ROWS = 10_000
-/** 导出按钮 hover 提示：说明端点契约与上限语义 */
+/** 导出按钮 hover 提示：说明端点契约与上限语义（T57b/F7：来源/类别/渠道同步透传导出） */
 const exportHint =
-  '按当前筛选（时间 / 结论；置信度与文本哈希为客户端过滤，导出不支持）下载 CSV。' +
+  '按当前筛选（时间 / 结论 / 来源 / 类别 / 渠道；置信度与文本哈希为客户端过滤，导出不支持）下载 CSV。' +
   '导出端点 GET /admin/logs/export 为全量流式（utf-8-sig BOM，Excel 兼容），' +
   `建议单次 ≤ ${EXPORT_MAX_ROWS.toLocaleString()} 行，超出时先缩小时间范围。`
 
@@ -169,13 +220,17 @@ const exporting = ref(false)
 /** 结果条数超过上限时的二次确认弹窗 */
 const exportWarnOpen = ref(false)
 
-/** 当前筛选对应的导出/查询参数（与 loadData 服务端参数一致） */
+/** 当前筛选对应的导出/查询参数（与 loadData 服务端参数一致）；
+ *  T57b/F7：来源/类别/Key 分组三维度透传（admin.py query_logs/export_logs 均支持） */
 function exportParams(): Record<string, unknown> {
   const hasV = conclusion.value === '' ? undefined : conclusion.value === 'true'
   return {
     start: toIso(startTime.value),
     end: toIso(endTime.value),
     has_violation: hasV,
+    source: sourceFilter.value || undefined,
+    category: categoryFilter.value.trim() || undefined,
+    key_tier: tierFilter.value || undefined,
   }
 }
 
@@ -205,18 +260,6 @@ function downloadCsv(text: string, filename: string): void {
   URL.revokeObjectURL(url)
 }
 
-/** 直连 http 的导出错误文案（镜像 client.readableError 的 {detail}/{error} 双错误体） */
-function exportErrorText(error: unknown): string {
-  const data = (error as { response?: { data?: unknown } } | undefined)?.response?.data
-  if (data && typeof data === 'object') {
-    const detail = (data as { detail?: unknown }).detail
-    if (typeof detail === 'string') return `导出失败：${detail}`
-    const errMsg = (data as { error?: unknown }).error
-    if (typeof errMsg === 'string') return `导出失败：${errMsg}`
-  }
-  return `导出失败：${error instanceof Error ? error.message : '请稍后重试'}`
-}
-
 async function runExport(): Promise<void> {
   exporting.value = true
   try {
@@ -242,7 +285,9 @@ async function runExport(): Promise<void> {
         : `已导出 ${dataRows} 条记录`,
     )
   } catch (error) {
-    toast.error(exportErrorText(error))
+    // 错误文案收敛自 client.ts errorText（F4①：{detail}/{error} 双错误体）；
+    // 导出为直连 http（不经 request()，无自动 Toast），此处手动弹
+    toast.error(`导出失败：${errorText(error)}`)
     console.warn('[AuditView] 导出 CSV 失败：', error)
   } finally {
     exporting.value = false
@@ -266,28 +311,10 @@ function toNum(value: string): number | undefined {
   return Number.isFinite(n) ? n : undefined
 }
 
-function textOf(value: unknown): string {
-  return value === null || value === undefined ? '' : String(value)
-}
-
-/** ISO 时间 → 本地可读时间文本 */
-function fmtTime(ts: unknown): string {
-  const s = textOf(ts)
-  if (!s) return '—'
-  const d = new Date(s)
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString()
-}
-
-/** 置信度 0~1 → 百分数文本 */
+/** 置信度 0~1 → 百分数文本；null/NaN → '—'（后端日志列可空，F9 透传 null） */
 function fmtConfidence(value: unknown): string {
-  if (typeof value !== 'number' || Number.isNaN(value)) return '—'
+  if (value === null || value === undefined || typeof value !== 'number' || Number.isNaN(value)) return '—'
   return `${(value * 100).toFixed(1)}%`
-}
-
-/** 文本哈希截断（title 显示全文） */
-function shortHash(value: unknown, len = 12): string {
-  const s = textOf(value)
-  return s ? (s.length > len ? `${s.slice(0, len)}…` : s) : '—'
 }
 
 /** 降级标记：detail.degraded（orchestrator 写入 "semantic:<原因码>"），无则 '—' */
@@ -305,23 +332,29 @@ function isViolation(row: LogRow): boolean {
 }
 
 // ---------- 数据加载 ----------
-/** 服务端分页模式 */
-async function fetchServerPage(params: Record<string, unknown>): Promise<void> {
-  const res = await apiGet<LogsPage>('/logs', { ...params, page: page.value, page_size: PAGE_SIZE })
+/** 服务端分页模式（signal 透传：切页/筛选/卸载可取消在途请求） */
+async function fetchServerPage(params: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+  const res = await apiGet<LogsPage>(
+    '/logs',
+    { ...params, page: page.value, page_size: PAGE_SIZE },
+    { signal },
+  )
   rows.value = res.items
   total.value = res.total
 }
 
-/** 客户端过滤模式：循环拉取窗口内全部记录（上限 40 页，超限截断近似） */
-async function fetchAllWindow(params: Record<string, unknown>): Promise<LogRow[]> {
-  const all: LogRow[] = []
-  for (let p = 1; p <= ALL_MAX_PAGES; p++) {
-    const res = await apiGet<LogsPage>('/logs', { ...params, page: p, page_size: ALL_PAGE_SIZE })
-    all.push(...res.items)
-    if (all.length >= res.total) break
-    if (res.items.length === 0) break
-  }
-  return all
+/**
+ * 客户端过滤模式：收敛到共享 fetchAllPaged（并发≤4 拉页、total 收敛即停）。
+ * maxPages=40 × 500 = 2 万条上限，超限截断近似（口径注释见文件头）。
+ */
+async function fetchAllWindow(params: Record<string, unknown>, signal?: AbortSignal): Promise<LogRow[]> {
+  const res = await fetchAllPaged<LogRow>('/logs', {
+    params,
+    pageSize: ALL_PAGE_SIZE,
+    maxPages: ALL_MAX_PAGES,
+    signal,
+  })
+  return res.items
 }
 
 /** 客户端过滤模式的内存分页切片 */
@@ -331,13 +364,19 @@ function applyClientPagination(): void {
 }
 
 async function loadData(): Promise<void> {
+  // 新一轮：中止旧在途请求 + 自增序号（乱序响应不落状态，F3）
+  const { signal, seq } = beginLoad()
   loading.value = true
   try {
     const hasV = conclusion.value === '' ? undefined : conclusion.value === 'true'
+    // T57b/F7：来源/类别/Key 分组三维度服务端透传（与导出参数 exportParams 一致）
     const params: Record<string, unknown> = {
       start: toIso(startTime.value),
       end: toIso(endTime.value),
       has_violation: hasV,
+      source: sourceFilter.value || undefined,
+      category: categoryFilter.value.trim() || undefined,
+      key_tier: tierFilter.value || undefined,
     }
     const min = toNum(confMin.value)
     const max = toNum(confMax.value)
@@ -345,7 +384,7 @@ async function loadData(): Promise<void> {
     inClientMode.value = min !== undefined || max !== undefined || hash !== ''
     if (inClientMode.value) {
       // 后端无置信度/文本哈希过滤参数 → 拉全量后内存过滤（口径注释见文件头）
-      let all = await fetchAllWindow(params)
+      let all = await fetchAllWindow(params, signal)
       if (min !== undefined) {
         all = all.filter((r) => typeof r.confidence === 'number' && r.confidence >= min)
       }
@@ -355,17 +394,26 @@ async function loadData(): Promise<void> {
       if (hash !== '') {
         all = all.filter((r) => textOf(r.text_hash).toLowerCase().includes(hash.toLowerCase()))
       }
-      clientRows.value = all
-      total.value = all.length
-      applyClientPagination()
+      // requestSeq 守卫：仅最新序号允许落状态（旧请求的响应即使先返回也被丢弃）
+      if (seq === requestSeq) {
+        clientRows.value = all
+        total.value = all.length
+        applyClientPagination()
+      }
     } else {
-      await fetchServerPage(params)
+      await fetchServerPage(params, signal)
     }
   } catch (error) {
+    // 主动取消（abort）不弹 Toast、不记录（isAxiosError ERR_CANCELED 已在 api 层静默）
+    if ((error as { code?: string })?.code === 'ERR_CANCELED' || (error as { name?: string })?.name === 'AbortError') {
+      return
+    }
     // 错误提示已由 api 层统一 Toast（401 除外）；此处仅记录调试信息
     console.warn('[AuditView] 加载审核记录失败：', error)
   } finally {
-    loading.value = false
+    if (seq === requestSeq) {
+      loading.value = false
+    }
   }
 }
 
@@ -381,6 +429,10 @@ function resetFilters(): void {
   confMin.value = ''
   confMax.value = ''
   textHash.value = ''
+  // T57b/F7：重置时一并清空服务端三维筛选
+  sourceFilter.value = ''
+  categoryFilter.value = ''
+  tierFilter.value = ''
   page.value = 1
   clientRows.value = []
   void loadData()
@@ -417,6 +469,8 @@ onBeforeUnmount(() => {
     window.clearInterval(refreshTimer)
     refreshTimer = undefined
   }
+  // 组件卸载：中止在途请求（防卸载后响应再落状态/请求堆积，F3）
+  abortInflight()
 })
 
 // ---------- 列定义（DataTable 结构类型传入；degraded 为派生列） ----------
@@ -457,6 +511,26 @@ const columns = [
             <option value="false">通过</option>
           </select>
         </label>
+        <!-- T57b/F7：服务端三维筛选（admin.py query_logs/export_logs 精确匹配） -->
+        <label class="filter-item">
+          <span class="filter-label">来源</span>
+          <select v-model="sourceFilter" class="input">
+            <option value="">全部来源</option>
+            <option v-for="(label, key) in SOURCE_LABELS" :key="key" :value="key">{{ label }}</option>
+          </select>
+        </label>
+        <label class="filter-item">
+          <span class="filter-label">类别</span>
+          <input v-model="categoryFilter" type="text" class="input" placeholder="类别精确匹配" />
+        </label>
+        <label class="filter-item">
+          <span class="filter-label">渠道（Key 分组）</span>
+          <select v-model="tierFilter" class="input">
+            <option value="">全部渠道</option>
+            <option value="standard">standard</option>
+            <option value="full">full</option>
+          </select>
+        </label>
         <label class="filter-item">
           <span class="filter-label">置信度 ≥</span>
           <input v-model="confMin" type="number" min="0" max="1" step="0.01" class="input" placeholder="0~1" />
@@ -477,6 +551,7 @@ const columns = [
       <p class="filter-note">
         注：置信度区间与文本哈希为客户端过滤（后端 /admin/logs 无对应参数，TODO），
         启用时最多拉取 2 万条窗口记录近似统计；「需人工」结论后端暂不存在（TODO）。
+        来源 / 类别 / 渠道（Key 分组）为服务端精确匹配（T57b/F7，透传 /logs 与 /logs/export）。
       </p>
     </div>
 
@@ -662,36 +737,6 @@ const columns = [
 .hash-cell {
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 0.76rem;
-}
-
-/* 结论 / 渠道 / 降级标签 */
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.tag-danger {
-  background: var(--danger-light);
-  color: var(--danger);
-}
-
-.tag-success {
-  background: var(--success-light);
-  color: var(--success);
-}
-
-.tag-blue {
-  background: var(--primary-light);
-  color: var(--primary);
-}
-
-.tag-gray {
-  background: var(--surface-hover);
-  color: var(--text-3);
 }
 
 /* 明细弹窗 */

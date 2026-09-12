@@ -11,6 +11,12 @@
  * - 最近 7 天审核趋势：ECharts 柱状图（双序列：每日审核数 / 每日违规数）；
  *   图表初始化失败时降级为「图表暂不可用 + 数据表格」；T35 暗色主题适配保留
  *
+ * T57a/F3（C3）重入与聚合收敛：
+ * - loadStats / loadHealth 加重入守卫：10s 自动刷新 tick 时若上一轮未完成则跳过
+ *   （防请求堆积，PRD §M5 F3 要求）
+ * - loadTrend 分页循环收敛到共享 fetchAllPaged（并发≤4 拉页、total 收敛即停；
+ *   maxPages=40 × 500 = 2 万条上限，超限截断近似——口径注释保留）
+ *
  * 数据口径（字段对齐依据 src/safefusion/api/admin.py，逐条核对）：
  * - 后端**没有** GET /admin/stats 端点（admin.py 全文核对结论），按任务卡约定
  *   用 /admin/logs 聚合：
@@ -38,6 +44,7 @@ import type { EChartsOption } from 'echarts'
 import StatCard from '../components/StatCard.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { apiGet } from '../api/client'
+import { fetchAllPaged } from '../utils/fetchAllPaged'
 import { useThemeStore } from '../stores/theme'
 
 /** GET /admin/logs 响应结构（admin.py query_logs） */
@@ -215,8 +222,12 @@ const dataTotal = computed(() => dataCells.value.reduce((sum, c) => sum + c.coun
 const router = useRouter()
 const health = ref<AdminHealth | null>(null)
 const healthLoading = ref(false)
+/** 重入守卫：上一轮 loadHealth 未完成时跳过本轮（自动刷新防堆积，F3） */
+let healthInFlight = false
 
 async function loadHealth(): Promise<void> {
+  if (healthInFlight) return
+  healthInFlight = true
   healthLoading.value = true
   try {
     health.value = await apiGet<AdminHealth>('/health')
@@ -224,6 +235,7 @@ async function loadHealth(): Promise<void> {
     // 失败由 api 层统一 Toast（401 除外）；保留上次健康数据（首次失败徽标呈「未知」态）
     console.warn('[OverviewView] 健康状态加载失败：', error)
   } finally {
+    healthInFlight = false
     healthLoading.value = false
   }
 }
@@ -280,6 +292,8 @@ const todayCount = ref(0) // 今日审核数
 const todayViolation = ref(0) // 今日违规数
 const cumulative = ref(0) // 累计审核数
 const loading = ref(false)
+/** 重入守卫：上一轮 loadStats 未完成则跳过（自动刷新防堆积，F3） */
+let statsInFlight = false
 const trendRows = ref<Array<{ day: string; count: number; violation: number }>>([])
 
 // ---------- 工具函数 ----------
@@ -319,22 +333,23 @@ async function fetchLogs(params: Record<string, unknown>): Promise<LogPage> {
   return apiGet<LogPage>('/logs', params)
 }
 
-/** 拉取 start 之后窗口内的全部日志（分页循环，上限截断近似） */
+/** 拉取 start 之后窗口内的全部日志（收敛 fetchAllPaged：并发≤4、total 收敛即停） */
 async function fetchTrendWindow(startIso: string): Promise<Array<Record<string, unknown>>> {
   const TREND_PAGE_SIZE = 500
   const TREND_MAX_PAGES = 40 // 上限 2 万条，超出截断为近似值（口径注释）
-  const rows: Array<Record<string, unknown>> = []
-  for (let page = 1; page <= TREND_MAX_PAGES; page++) {
-    const res = await fetchLogs({ start: startIso, page, page_size: TREND_PAGE_SIZE })
-    rows.push(...res.items)
-    if (rows.length >= res.total) break
-    if (res.items.length === 0) break // 防御：空页即止
-  }
-  return rows
+  const res = await fetchAllPaged<Record<string, unknown>>('/logs', {
+    params: { start: startIso },
+    pageSize: TREND_PAGE_SIZE,
+    maxPages: TREND_MAX_PAGES,
+  })
+  return res.items
 }
 
 /** 统计卡片：累计 / 今日 / 今日违规（三次 page_size=1 的 COUNT 查询） */
 async function loadStats(): Promise<void> {
+  // 重入守卫：上一轮 loadStats 未完成则跳过（自动刷新 10s tick 防堆积，F3）
+  if (statsInFlight) return
+  statsInFlight = true
   loading.value = true
   try {
     const start = todayStartIso()
@@ -350,6 +365,7 @@ async function loadStats(): Promise<void> {
     // 失败由 api 层统一 Toast（401 除外）；数值保持 0，趋势可能随后失败
     console.warn('[OverviewView] 统计加载失败：', error)
   } finally {
+    statsInFlight = false
     loading.value = false
   }
 }

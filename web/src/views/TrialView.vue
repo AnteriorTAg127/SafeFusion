@@ -10,17 +10,31 @@
  *
  * 字段契约（读后端源码）：schemas.AuditRequest（仅提交 text）/
  * AuditResult（model_dump 返回）；admin.py test-examples → {items,total}。
+ *
+ * T57a/F2：test-audit 请求走 SLOW_TIMEOUT_MS（120s）——首图懒装配
+ * （语义模型按需装配）场景可能远超默认 15s，原全局超时会造成假失败
+ * 而后端已写库；超时专属 Toast「请勿重复提交」。其余本页改动归 T57c/F8。
+ *
+ * T57c/F8（S1）资源与口径：
+ * - 图片预览 objectURL 四时机统一 revoke：换选（onImagePick 重建前先释放旧的）、
+ *   删图（removeImage）、发送成功后（send 结束释放预览，避免预览图驻留内存——
+ *   结果区只展示文本/命中，不再引用预览图）、组件卸载（onBeforeUnmount 全量 revoke）。
+ * - 「耗时」口径：durationMs = 发送（含前端 base64 编码）→ 响应全程，
+ *   前端实测值与后端日志 duration 属同数量级但**含前端编码/上传**；
+ *   面板明示「含前端编码/上传」（见 EvidencePanel durationMs 注释）。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import EvidencePanel from '../components/EvidencePanel.vue'
 import EmptyState from '../components/EmptyState.vue'
-import { apiGet, apiPost } from '../api/client'
+import { apiGet, apiPost, errorText, SLOW_TIMEOUT_MS } from '../api/client'
 import type { AuditResult, ExamplesResponse, TrialExample } from '../api/types'
 
 const EXAMPLES_MAX = 20 // 后端抽样上限（PRD M2；前端同 20 条展示窗口）
 
 // ---------- 输入/示例状态 ----------
 const inputText = ref('')
+const selectedImages = ref<File[]>([])
+const imagePreviews = ref<string[]>([])
 const examples = ref<TrialExample[]>([])
 const examplesLoading = ref(false)
 const autoSend = ref(true) // 点击示例后自动发送
@@ -32,7 +46,54 @@ const error = ref('')
 const durationMs = ref(0)
 const hasSent = ref(false) // 是否成功发送过（结果区空态判断）
 
-const canSend = computed(() => inputText.value.trim() !== '')
+const canSend = computed(() => inputText.value.trim() !== '' || selectedImages.value.length > 0)
+
+// ---------- 图片预览 objectURL 生命周期（T57c/F8：四时机 revoke） ----------
+
+/** 释放全部预览 objectURL（换选前 / 发送成功后 / 组件卸载共用） */
+function revokeAllPreviews(): void {
+  for (const url of imagePreviews.value) URL.revokeObjectURL(url)
+  imagePreviews.value = []
+}
+
+/** 释放单个预览 objectURL（删图） */
+function revokePreview(index: number): void {
+  const url = imagePreviews.value[index]
+  if (url) URL.revokeObjectURL(url)
+}
+
+// ---------- 图片选择（PRD v0.4.0 M5：试运行支持上传图片） ----------
+function onImagePick(event: Event): void {
+  const input = event.target as HTMLInputElement
+  const files = input.files
+  if (!files || files.length === 0) return
+  // F8 时机①换图：先释放上一批预览 objectURL，再重建（避免旧 URL 泄漏）
+  revokeAllPreviews()
+  selectedImages.value = Array.from(files)
+  imagePreviews.value = selectedImages.value.map((f) => URL.createObjectURL(f))
+  input.value = ''
+}
+
+function removeImage(index: number): void {
+  // F8 时机②删图：释放该预览 URL 再移除引用
+  revokePreview(index)
+  selectedImages.value.splice(index, 1)
+  imagePreviews.value.splice(index, 1)
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      // 保留 data URI 中的 base64 部分（AuditRequest.images[].base64 契约）
+      const comma = result.indexOf(',')
+      resolve(comma >= 0 ? result.slice(comma + 1) : result)
+    }
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
 
 // ---------- 随机示例 ----------
 async function loadExamples(): Promise<void> {
@@ -56,28 +117,31 @@ function pickExample(ex: TrialExample): void {
 }
 
 // ---------- 发送 ----------
-/** 从错误对象提取可读文案（对齐 client.ts readableError 的 detail/error 双响应体） */
-function errorText(err: unknown): string {
-  const e = err as { response?: { data?: unknown; status?: number }; message?: string }
-  const data = e?.response?.data
-  if (data && typeof data === 'object') {
-    const body = data as { detail?: unknown; error?: unknown }
-    if (typeof body.detail === 'string') return body.detail
-    if (typeof body.error === 'string') return body.error
-  }
-  if (e?.response?.status === 401) return 'Token 无效或已过期'
-  return e?.message ?? '请求失败'
-}
-
+// 错误文案收敛自 client.ts 导出的 errorText（F4①：detail/error 双响应体 + 超时
+// 专属文案 + 401 兜底，原本页本地实现删除；api 层已 Toast，此处仅内联展示）
 async function send(): Promise<void> {
-  const text = inputText.value.trim()
-  if (!text || sending.value) return
+  if (!canSend.value || sending.value) return
   sending.value = true
   error.value = ''
+  // 耗时口径（F8）：t0 起于发送前（含前端 base64 编码/上传），止于响应返回；
+  // 与后端日志 duration 同数量级但含前端开销——见 EvidencePanel durationMs 注释
   const t0 = performance.now()
   try {
-    result.value = await apiPost<AuditResult>('/test-audit', { text })
+    const images = []
+    for (const file of selectedImages.value) {
+      images.push({ base64: await fileToBase64(file) })
+    }
+    const payload: Record<string, unknown> = { text: inputText.value.trim() || null }
+    if (images.length > 0) payload.images = images
+    // 首图懒装配场景可能远超 15s → 120s 慢超时（T57a/F2）
+    result.value = await apiPost<AuditResult>('/test-audit', payload, undefined, {
+      timeoutMs: SLOW_TIMEOUT_MS,
+    })
     hasSent.value = true
+    // F8 时机③发送成功后：释放预览 objectURL 并清空图片队列（结果区不再引用
+    // 预览图，避免驻留内存；图片文件本体随队列一并清掉，界面与状态一致）
+    revokeAllPreviews()
+    selectedImages.value = []
   } catch (err) {
     // api 层已 Toast（401 除外）；此处内联展示错误卡片便于结果区自解释
     error.value = errorText(err)
@@ -90,13 +154,18 @@ async function send(): Promise<void> {
 onMounted(() => {
   void loadExamples()
 })
+
+// F8 时机④组件卸载：全量释放预览 objectURL（路由切走时不泄漏）
+onBeforeUnmount(() => {
+  revokeAllPreviews()
+})
 </script>
 
 <template>
   <section class="page-view">
     <h2 class="page-title">🧪 试运行</h2>
     <p class="page-hint">
-      现场验证全链路：输入文本（或点一个随机示例）→ 发送 → 分层证据逐层展示，
+      现场验证全链路：输入文本或上传图片（或点一个随机示例）→ 发送 → 分层证据逐层展示，
       系统判定「为什么违规 / 为什么通过」当场可见。
     </p>
 
@@ -117,6 +186,21 @@ onMounted(() => {
         placeholder="粘贴或输入文本，Ctrl+Enter 快捷发送……"
         @keydown.ctrl.enter.prevent="send"
       ></textarea>
+      <div class="trial-images">
+        <input
+          type="file"
+          class="input add-file"
+          accept="image/*"
+          multiple
+          @change="onImagePick"
+        />
+        <div v-if="imagePreviews.length" class="trial-preview-list">
+          <div v-for="(src, i) in imagePreviews" :key="i" class="trial-preview-item">
+            <img :src="src" alt="待审核图片预览" />
+            <button type="button" class="trial-preview-remove" @click="removeImage(i)">✕</button>
+          </div>
+        </div>
+      </div>
       <div class="trial-actions">
         <button
           type="button"
@@ -174,7 +258,7 @@ onMounted(() => {
       <EmptyState
         icon="🧪"
         title="还没有试运行结果"
-        :hint="'输入一段文本，或点一个随机示例立即发送，判定与分层证据（关键词 / 正则 / 语义 / 白名单 / LLM）会显示在下方。\n试运行以管理端 full 权限执行，返回完整证据明细。'"
+        :hint="'输入一段文本或上传图片，或点一个随机示例立即发送，判定与分层证据（关键词 / 正则 / 语义 / 白名单 / LLM）会显示在下方。\n试运行以管理端 full 权限执行，返回完整证据明细。'"
         action-text="加载随机示例"
         @action="loadExamples"
       />
@@ -240,6 +324,55 @@ onMounted(() => {
   font-size: 0.74rem;
   color: var(--text-3);
   line-height: 1.7;
+}
+
+/* 图片选择与预览（PRD v0.4.0 M5） */
+.trial-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.add-file {
+  flex: 1 1 260px;
+  padding: 6px 10px;
+}
+
+.trial-preview-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.trial-preview-item {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.trial-preview-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.trial-preview-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 0.66rem;
+  line-height: 1;
+  cursor: pointer;
 }
 
 /* 示例 chips 滚动区 */
@@ -320,20 +453,5 @@ onMounted(() => {
   font-size: 0.82rem;
   color: var(--text-2);
   word-break: break-word;
-}
-
-/* 标签语义（自含） */
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.tag-danger {
-  background: var(--danger-light);
-  color: var(--danger);
 }
 </style>

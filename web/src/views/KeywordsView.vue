@@ -10,19 +10,20 @@
  * - T41「🧹 一键去重」：列表卡顶部按钮 → ConfirmDialog 说明副作用（自动备份 zip
  *   到 data/backups/、去重后引擎重载、不可撤销）→ POST /admin/keywords/dedup →
  *   成功 Toast + AppModal 结果摘要（前后条数 / 无法去重数 / 备份文件名 / 引擎重载）。
- *   ⚠️ 后端尚无 dedup 端点（admin.py 全文核对：仅 import/list/delete 三端点，
- *   PRD §M9 G10 由主模型集成阶段补后端）→ 前端按如下契约先写好调用：
- *   POST /admin/keywords/dedup → { status, before, after, removed, failed,
- *   backup_file, reload }；未就绪时该请求会 404/405 并由 api 层 Toast 报错，
- *   不阻塞其它功能（见报告 TODO）。
+ *   ⚠️ F4④ 注释修正（已对照 admin.py <2026-08-29>）：dedup 端点**已实现**于
+ *   admin.py:924（先备份 zip 至 data/backups/，按 (category, word) 去重保留最小 id，
+ *   完成后容器热重载，reload ∈ ok|skipped|failed），响应契约与下方 DedupResult 一致；
+ *   旧注释「后端尚无 dedup 端点」为过时信息（v0.3.0 集成阶段已由主模型补齐）。
  *
  * 字段对齐（依据 src/safefusion/api/admin.py、storage/database.py keywords 表）：
  *   GET /admin/keywords?category&page&page_size → { total, page, page_size,
  *   items:[{ id, category, word, source }] }（无黑白池字段！）
  *   POST /admin/keywords/import（multipart file + category 查询参数，TXT 必填）→
- *   { inserted, skipped, total }；词条无单条 POST 端点，单条添加以「TXT 一行
- *   一词 + category 参数」复用导入接口（POST /admin/keywords/import）。
- *   DELETE /admin/keywords/{keyword_id} → { deleted }；404 时响 4xx。
+ *   { inserted, skipped, total, reload }（reload ∈ ok|failed|skipped，v0.5.0 起
+ *   写库后即时热重载引擎）；CSV 表头支持中英文别名且大小写不敏感；词条无单条
+ *   POST 端点，单条添加以「TXT 一行一词 + category 参数」复用导入接口。
+ *   DELETE /admin/keywords/{keyword_id} → { deleted, reload }；404 时响 4xx。
+ *   ⚠️ reload=failed 时前端必须显式告警（否则「导入成功」= 虚假成功反馈）。
  *
  * 已知后端缺口（写入报告 TODO）：
  * - keywords 表无 pool 字段：任务卡「池（黑/白）筛选/黑白词库数量」无法满足 →
@@ -30,6 +31,14 @@
  *   （vector_store black/white 池）与永久黑白名单（内容哈希）层面，非词库表。
  * - GET /admin/keywords 不支持词条模糊搜索 → 关键词模糊为客户端过滤
  *   （先拉全量，最多 100 页 × 500 = 5 万条，超限截断近似）。
+ *
+ * T57a/F2+F3：
+ * - 导入/单条添加/去重走 SLOW_TIMEOUT_MS（120s）：大词库导入可能 >15s，
+ *   原全局 15s 超时会造成「前端假失败而后端已写库」→ 重复导入脏数据；
+ *   超时专属 Toast 提示「请勿重复提交」（client.ts F2）。
+ * - 全量拉取收敛到共享 fetchAllPaged（并发≤4、total 收敛即停；
+ *   maxPages=100 页上限 5 万条截断近似——口径注释保留）。
+ * - submitting 态复核：添加/导入/去重期间提交按钮禁用防双击重复提交。
  */
 import { onMounted, ref } from 'vue'
 import StatCard from '../components/StatCard.vue'
@@ -38,22 +47,18 @@ import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 import AppModal from '../components/AppModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
-import { apiGet, apiPost, apiDelete } from '../api/client'
+import { apiPost, apiDelete, SLOW_TIMEOUT_MS } from '../api/client'
+import { fetchAllPaged } from '../utils/fetchAllPaged'
+import { textOf } from '../utils/format'
 import { useToastStore } from '../stores/toast'
-
-/** GET /admin/keywords 响应结构 */
-interface KeywordsPage {
-  total: number
-  page: number
-  page_size: number
-  items: Array<Record<string, unknown>>
-}
 
 /** POST /admin/keywords/import 响应结构 */
 interface ImportResult {
   inserted: number
   skipped: number
   total: number
+  /** 引擎热重载结果：ok | failed | skipped（v0.5.0 起导入/删除均返回） */
+  reload?: string
 }
 
 type KeywordRow = Record<string, unknown>
@@ -75,7 +80,7 @@ const submitting = ref(false)
 
 // ---------- T41：一键去重 ----------
 /**
- * POST /admin/keywords/dedup 期望响应契约（后端由主模型集成阶段补，见文件头注释）：
+ * POST /admin/keywords/dedup 响应契约（F4④：端点已实现于 admin.py:924，见文件头）：
  * { status: "ok", before, after, removed, failed, backup_file, reload }
  * 字段缺失时前端以「—」展示，绝不臆造数值。
  */
@@ -106,12 +111,15 @@ async function confirmDedup(): Promise<void> {
   dedupAskOpen.value = false
   dedupRunning.value = true
   try {
-    const res = await apiPost<DedupResult>('/keywords/dedup')
+    // 去重可能耗时较长（备份 zip + 全量变体去重 + 引擎重载）→ 120s 慢超时（F2）
+    const res = await apiPost<DedupResult>('/keywords/dedup', undefined, undefined, {
+      timeoutMs: SLOW_TIMEOUT_MS,
+    })
     dedupResult.value = res
     toast.success(res.status === 'ok' ? '去重完成（词库已更新）' : '去重返回（请查看结果摘要）')
     await loadData() // 去重后刷新列表/统计
   } catch (error) {
-    // 后端未就绪时 404/405 已由 api 层 Toast（TODO：主模型补 POST /admin/keywords/dedup）
+    // 去重失败（备份失败 500 / 数据库异常）已由 api 层 Toast（F4④：端点已就绪）
     console.warn('[KeywordsView] 词库去重失败：', error)
   } finally {
     dedupRunning.value = false
@@ -124,6 +132,18 @@ function reloadText(value: unknown): string {
   if (value === 'skipped') return '⏭ 跳过（未注入重载钩子）'
   if (value === 'failed') return '❌ 重载失败'
   return value === null || value === undefined ? '—' : String(value)
+}
+
+/**
+ * 写入成功但热重载失败时必须显式告警。
+ *
+ * 否则界面只回显「导入成功 N 条」，而新词条在进程重启前**完全不参与审核**——
+ * 运维会据此认为违禁词已上线（v0.5.0 缺陷 1 的虚假成功反馈）。
+ */
+function warnIfReloadFailed(reload: string | undefined): void {
+  if (reload === 'failed') {
+    toast.error('词库已写入，但引擎热重载失败：新词条在进程重启前不会生效，请检查服务日志')
+  }
 }
 
 /** 数值结果展示（未知字段回退「—」） */
@@ -152,20 +172,14 @@ function scrollToAddPanel(): void {
   addPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
-function textOf(value: unknown): string {
-  return value === null || value === undefined ? '' : String(value)
-}
-
 // ---------- 数据加载 ----------
-/** 循环拉取全部词条（统计 + 内存过滤基础） */
+/** 全量拉取词条（统计 + 内存过滤基础；收敛 fetchAllPaged：并发≤4、total 收敛即停） */
 async function fetchAll(): Promise<void> {
-  const all: KeywordRow[] = []
-  for (let p = 1; p <= ALL_MAX_PAGES; p++) {
-    const res = await apiGet<KeywordsPage>('/keywords', { page: p, page_size: ALL_PAGE_SIZE })
-    all.push(...res.items)
-    if (all.length >= res.total) break
-    if (res.items.length === 0) break
-  }
+  const res = await fetchAllPaged<KeywordRow>('/keywords', {
+    pageSize: ALL_PAGE_SIZE,
+    maxPages: ALL_MAX_PAGES,
+  })
+  const all = res.items
   allRows.value = all
   // 统计：词条总数 / 分类数（distinct，去空）
   totalCount.value = all.length
@@ -236,9 +250,13 @@ async function addKeyword(): Promise<void> {
     // 单条词条编码为「TXT 一行一词」，category 走查询参数（对齐 POST /admin/keywords/import）
     const blob = new File([`${word}\n`], `kw-${Date.now()}.txt`, { type: 'text/plain' })
     fd.append('file', blob)
-    const res = await apiPost<ImportResult>('/keywords/import', fd, { category })
+    // 导入可能 >15s（大词库/慢盘）→ 120s 慢超时（F2：防假失败后重复提交）
+    const res = await apiPost<ImportResult>('/keywords/import', fd, { category }, {
+      timeoutMs: SLOW_TIMEOUT_MS,
+    })
     if (res.inserted > 0) toast.success(`已添加词条「${word}」（${category}）`)
     if (res.skipped > 0) toast.info(`跳过 ${res.skipped} 条重复词条（category+word 唯一）`)
+    warnIfReloadFailed(res.reload)
     addWord.value = ''
     await loadData()
   } catch (error) {
@@ -268,10 +286,14 @@ async function importFromFile(): Promise<void> {
     const fd = new FormData()
     fd.append('file', file)
     // TXT（按行解析）需要 category 查询参数；CSV（类别,词两列）不需要
+    // 导入可能 >15s（大词库/慢盘）→ 120s 慢超时（F2：防假失败后重复提交）
     const res = await apiPost<ImportResult>('/keywords/import', fd, {
       category: ext === 'txt' ? addCategory.value.trim() : undefined,
+    }, {
+      timeoutMs: SLOW_TIMEOUT_MS,
     })
     toast.success(`导入完成：新增 ${res.inserted} 条${res.skipped ? `，跳过重复 ${res.skipped} 条` : ''}`)
+    warnIfReloadFailed(res.reload)
     if (importFile.value) importFile.value.value = ''
     await loadData()
   } catch (error) {
@@ -290,8 +312,9 @@ async function confirmDelete(): Promise<void> {
   const row = deleting.value
   if (!row) return
   try {
-    await apiDelete(`/keywords/${String(row.id)}`)
+    const res = await apiDelete<{ deleted: number; reload?: string }>(`/keywords/${String(row.id)}`)
     toast.success('词条已删除')
+    warnIfReloadFailed(res.reload)
     await loadData()
   } catch (error) {
     console.warn('[KeywordsView] 删除词条失败：', error)
@@ -418,7 +441,7 @@ const columns = [
           type="button"
           class="btn btn-danger btn-sm"
           :disabled="dedupRunning || loading"
-          :title="'去重前自动备份 zip 到 data/backups/；去重后词库引擎自动重载（后端端点由主模型集成阶段补，未就绪时会报错）'"
+          :title="'去重前自动备份 zip 到 data/backups/；去重后词库引擎自动重载（端点已实现于 admin.py:924，F4④）'"
           @click="askDedup"
         >
           {{ dedupRunning ? '去重中…' : '🧹 一键去重' }}
@@ -611,20 +634,6 @@ const columns = [
 
 .pool-placeholder {
   color: var(--text-3);
-}
-
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.tag-blue {
-  background: var(--primary-light);
-  color: var(--primary);
 }
 
 /* T41：去重结果摘要表 */

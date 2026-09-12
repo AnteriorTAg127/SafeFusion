@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 系统设置页（T25 全量配置表单 + T36 操作提示 + T39 v0.3.0 改造）：
+ * 系统设置页（T25 全量配置表单 + T36 操作提示 + T39 v0.3.0 改造 + T57c/F11 拆分）：
  * - 按 GET /admin/config 实际返回的分组渲染「group-card」表单卡片：已知分组
  *   （server / thresholds / embedding / llm / cache / light_model / logging /
  *   image / keyword / semantic / review，对应 config_override.get_config_groups()
@@ -28,38 +28,45 @@
  * - 测试连接（v0.3.0 M5，T39）：embedding / llm / light_model 分组卡各加
  *   「🔌 测试连接」→ POST /admin/config/test-connection {channel} → 内联结果条
  *   （✅ 通过 / ❌ 失败 + 耗时 / 维度等 detail）。
- * - 模型卡（v0.3.0 M6，T39）：页面顶部「🤖 模型」卡——GET /admin/models 渲染
- *   chinese-clip / fasttext / 语义引擎 / 向量库状态行（徽标 + 缓存路径/大小/
- *   条数/维度细节）；本地 CLIP 未下载时「⬇️ 下载模型」（POST download → 1s 轮询
- *   GET download/{task_id} 进度百分比 → 完成 Toast）与「🔄 装配 / 重新加载」
- *   （POST load）；fasttext 未就绪时展示指向 light_model 分组字段的配置指引；
- *   页面活动时每 10s 轮询模型状态（document.hidden 跳过、回前台即刷）。
+ * - 模型卡（v0.3.0 M6，T39 + T57c/F11）：状态/下载/装配轮询机整体迁入
+ *   composables/useModelCard.ts，本页仅消费返回值（模板保持不变）。
  * - 安全卡（v0.3.0 M9 C5，T39）：🔐 改密——当前密码 + 新密码（≥10 位）+ 确认
  *   新密码 → POST /admin/config/password；成功 Toast「已修改，旧令牌立即失效」
  *   并**立即登出**（旧令牌已失效，本会话继续发请求只会 401，必须回登录页）。
  * - 422 / 400 错误文案由 api client 统一 Toast（兼容 {error} 与 {detail} 两种
  *   错误体），前端不再重复弹窗。
- * - TODO(歧义-已知后端行为)：
- *   1) PUT 部分键覆盖语义：前端提交全量非密钥字段，若后端语义变化可退回仅提交
- *      改动字段（当前全量提交在两种语义下均安全）；
- *   2) logging.level / image.animated.mode / embedding.local.device 后端暂无
- *      白名单校验（仅业务规则校验 backend/fuse_mode），select 提供已知合法值，
- *      服务端返回未知取值时追加「(未知)」选项展示，不静默丢失；
- *   3) 密钥 configured 反映「当前进程环境变量是否已设置」，前端只读（决策 F）；
- *      保存即热应用生效（applied=false 仅出现在未注入容器的测试部署）。
+ *
+ * T57c/F11 拆分结构：
+ * - views/settings/configFields.ts：GROUP_META 及其类型（FieldMeta/SectionMeta/
+ *   GroupMeta/MaskedSecret/FieldKind）整体迁出，导出类型不变；
+ * - views/settings/configForm.ts：无 Vue 依赖的纯表单引擎（flattenGroup /
+ *   setNested / buildPayload / synthesizeGroup / detectKind / isMaskedSecret），
+ *   buildPayload 错误经 { ok:false, error } 返回，本页负责弹 Toast；
+ * - composables/useModelCard.ts：模型卡状态 + 10s 轮询 + 下载 1s 轮询 +
+ *   装配调用（onMounted/onUnmounted 清理内聚在组合式内）；
+ * - 本地 textOf 删除，改 import utils/format（T57b 移交项）。
+ * 对外行为零变化：保存/恢复默认/测试连接/改密/下载/装配/来源徽标/JSON 数组编辑原样。
+ *
+ * TODO(歧义-已知后端行为)：
+ * 1) PUT 部分键覆盖语义：前端提交全量非密钥字段，若后端语义变化可退回仅提交
+ *    改动字段（当前全量提交在两种语义下均安全）；
+ * 2) logging.level / image.animated.mode / embedding.local.device 后端暂无
+ *    白名单校验（仅业务规则校验 backend/fuse_mode），select 提供已知合法值，
+ *    服务端返回未知取值时追加「(未知)」选项展示，不静默丢失；
+ * 3) 密钥 configured 反映「当前进程环境变量是否已设置」，前端只读（决策 F）；
+ *    保存即热应用生效（applied=false 仅出现在未注入容器的测试部署）。
  */
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { apiGet, apiPost, apiPut } from '../api/client'
 import router from '../router'
 import { useAuthStore } from '../stores/auth'
 import { useToastStore } from '../stores/toast'
-
-/** 密钥遮蔽对象（config_override.mask_secret_fields 输出形态） */
-interface MaskedSecret {
-  api_key_env: string | null
-  configured: boolean
-}
+import { textOf } from '../utils/format'
+import { GROUP_META } from './settings/configFields'
+import type { FieldMeta, GroupMeta, MaskedSecret } from './settings/configFields'
+import { buildPayload, flattenGroup, isMaskedSecret, synthesizeGroup } from './settings/configForm'
+import { useModelCard } from '../composables/useModelCard'
 
 /** GET /admin/config → { 分组名: 分组配置（api_key 已遮蔽） } */
 type ConfigResponse = Record<string, Record<string, unknown>>
@@ -92,381 +99,6 @@ interface TestConnectionResult {
   detail: Record<string, unknown>
 }
 
-/** GET /admin/models 响应（api/admin.py list_models） */
-interface ModelsResponse {
-  hf_cache_dir?: string
-  chinese_clip?: {
-    backend: string
-    model_name?: string
-    weights_path?: string | null
-    cache_dir?: string
-    loaded?: boolean
-    load_status?: string
-    load_reason?: string | null
-    cached_files?: number | null
-    cache_size_bytes?: number | null
-    cache_partial?: boolean
-    /** cloud / ready / error / downloading / not_downloaded */
-    status?: string
-    message?: string
-  }
-  fasttext?: {
-    configured: boolean
-    model_path?: string | null
-    config_path?: string | null
-    model_file_exists?: boolean
-    config_file_exists?: boolean
-    loadable?: boolean
-    /** ready / error / missing / not_configured */
-    status?: string
-  }
-  vector_store?: {
-    black: { count: number; dim: number | null }
-    white: { count: number; dim: number | null }
-  }
-  semantic?: {
-    ready: boolean
-    status?: string
-    reason?: string | null
-    backend?: string
-  }
-}
-
-/** GET /admin/models/download/{task_id} 进度快照（model_repo.DownloadTask.snapshot） */
-interface DownloadTask {
-  task_id: string
-  model_name?: string
-  status: 'running' | 'completed' | 'failed'
-  stage?: string
-  progress?: number
-  downloaded_bytes?: number
-  total_bytes?: number
-  error?: string | null
-}
-
-type FieldKind = 'bool' | 'int' | 'float' | 'text' | 'select' | 'secret'
-
-/** 字段元数据（label 来自 config.py description，类型来自模型注解） */
-interface FieldMeta {
-  key: string
-  label: string
-  kind: FieldKind
-  /** select 取值白名单（对齐 config.py / config_override.py 合法值） */
-  options?: string[]
-  /** 后端为 str | None 可空字段：空输入提交 null（未配置） */
-  nullable?: boolean
-  /** 数值输入 min/max 提示（对齐 config_override._RANGE_RULES [0,1] 组） */
-  min?: number
-  max?: number
-  hint?: string
-}
-
-interface SectionMeta {
-  title: string
-  desc?: string
-  fields: FieldMeta[]
-}
-
-interface GroupMeta {
-  group: string
-  title: string
-  icon: string
-  desc?: string
-  sections: SectionMeta[]
-  /** 由 synthesizeGroup 生成的兜底分组（GROUP_META 未收录）标记 */
-  synthetic?: boolean
-}
-
-/**
- * 分组字段清单（依据 src/safefusion/config.py 各模型字段与 description）。
- * 注意：所有 str 字段（除 null 可空外）后端 validate_group_update 会做必填
- * 非空校验，故 label 里同步标注「必填」。
- */
-const GROUP_META: GroupMeta[] = [
-  {
-    group: 'server',
-    title: '服务监听',
-    icon: '🖥️',
-    desc: '审核/管理双端口监听配置（内置默认 < config.yaml < DB 配置 < 环境变量；端口变更下次启动生效）',
-    sections: [
-      {
-        title: '服务监听',
-        fields: [
-          { key: 'host', label: 'host：审核 API 监听地址（必填）', kind: 'text' },
-          { key: 'port', label: 'port：审核 API 端口（:8000，必填）', kind: 'int', min: 1, max: 65535 },
-          { key: 'admin_port', label: 'admin_port：管理 API 端口（:8001，必填）', kind: 'int', min: 1, max: 65535 },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'thresholds',
-    title: '判定阈值',
-    icon: '🎯',
-    desc: '语义层判定阈值与置信度分档（范围 [0,1]，对数轴脱敏后由用户校准）',
-    sections: [
-      {
-        title: '判定阈值',
-        fields: [
-          { key: 'semantic_threshold', label: '语义层判定违规的相似度阈值（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'margin_w', label: '黑均分−白均分差值与 margin 的比较基准（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'confidence_low', label: '置信度低档上界，低于则判定安全（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'confidence_high', label: '置信度高档下界，高于则判定违规（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'phash_whitelist_distance', label: '图片白名单 pHash 汉明距离阈值（必填）', kind: 'int', min: 0, max: 64 },
-          { key: 'phash_dedup_distance', label: '图片去重缓存近似命中 pHash 阈值（必填）', kind: 'int', min: 0, max: 64 },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'embedding',
-    title: 'Embedding 双后端',
-    icon: '🧬',
-    desc: 'backend 切换 local/cloud；云端 Key 仅环境变量注入，此处只显示变量名',
-    sections: [
-      {
-        title: '后端选择',
-        fields: [
-          {
-            key: 'backend',
-            label: 'backend（必填）',
-            kind: 'select',
-            options: ['local', 'cloud'],
-            hint: '切换至 cloud 时需填齐云端 base_url/model（后端必填校验），且 fuse_mode 需为 concat',
-          },
-        ],
-      },
-      {
-        title: '本地后端（local）',
-        fields: [
-          { key: 'local.model_name', label: 'HF 模型名或本地权重标识（必填）', kind: 'text' },
-          { key: 'local.weights_path', label: '本地权重目录；null 使用 HF 缓存', kind: 'text', nullable: true },
-          {
-            key: 'local.device',
-            label: 'device（必填）',
-            kind: 'select',
-            options: ['auto', 'cpu', 'cuda'],
-            hint: 'auto（GPU 可用则用）| cpu | cuda',
-          },
-        ],
-      },
-      {
-        title: '云端后端（cloud）',
-        fields: [
-          { key: 'cloud.base_url', label: '云端 Embedding API base_url', kind: 'text', nullable: true },
-          { key: 'cloud.model', label: '云端 embedding 模型名', kind: 'text', nullable: true },
-          {
-            key: 'cloud.api_key_env',
-            label: '云端 Key 环境变量名',
-            kind: 'text',
-            nullable: true,
-            hint: 'null 时仅认 SAFEFUSION_EMBEDDING_API_KEY',
-          },
-          { key: 'cloud.api_key', label: '云端 Key（密钥，仅显示变量名）', kind: 'secret' },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'llm',
-    title: 'LLM 兜底',
-    icon: '🤖',
-    desc: 'OpenAI 兼容 LLM 兜底；api_key 仅环境变量注入，此处只显示变量名',
-    sections: [
-      {
-        title: 'LLM 兜底',
-        fields: [
-          { key: 'base_url', label: 'OpenAI 兼容服务地址（必填）', kind: 'text' },
-          { key: 'model', label: '兜底模型名（必填）', kind: 'text' },
-          {
-            key: 'api_key_env',
-            label: 'Key 环境变量名（必填）',
-            kind: 'text',
-            hint: '其实也认 SAFEFUSION_LLM_API_KEY（优先级更高）',
-          },
-          { key: 'timeout', label: '单次调用超时（秒，必填）', kind: 'float', min: 0 },
-          { key: 'max_retry', label: 'JSON 输出解析失败重试次数（必填）', kind: 'int', min: 0 },
-          { key: 'short_text_max_length', label: '短文本 LLM 缓存判定的文本长度上限（必填）', kind: 'int', min: 1 },
-          { key: 'api_key', label: 'LLM Key（密钥，仅显示变量名）', kind: 'secret' },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'cache',
-    title: '五级缓存',
-    icon: '🗃️',
-    desc: 'backend 切换 memory/redis；每级缓存可独立开关、容量、TTL',
-    sections: [
-      {
-        title: '缓存后端',
-        fields: [
-          {
-            key: 'backend',
-            label: 'backend（必填）',
-            kind: 'select',
-            options: ['memory', 'redis'],
-            hint: 'memory（进程内，默认）| redis（需提供下方 Redis 连接）',
-          },
-          { key: 'redis.url', label: 'Redis 连接 URL（必填）', kind: 'text' },
-          { key: 'redis.prefix', label: '缓存键统一前缀（必填）', kind: 'text' },
-        ],
-      },
-      {
-        title: '① 审核缓存',
-        desc: '完整键（文本哈希+帧哈希+关键参数）',
-        fields: [
-          { key: 'audit_cache.enabled', label: '关卡：关闭时该级缓存直通', kind: 'bool' },
-          { key: 'audit_cache.capacity', label: '容量上限（条目数，必填）', kind: 'int', min: 0 },
-          { key: 'audit_cache.ttl', label: 'TTL（秒，必填）', kind: 'float', min: 0 },
-        ],
-      },
-      {
-        title: '② 高频缓存',
-        desc: '无上下文请求（LRU+TTL）',
-        fields: [
-          { key: 'high_freq_cache.enabled', label: '关卡：关闭时该级缓存直通', kind: 'bool' },
-          { key: 'high_freq_cache.capacity', label: '容量上限（条目数，必填）', kind: 'int', min: 0 },
-          { key: 'high_freq_cache.ttl', label: 'TTL（秒，必填）', kind: 'float', min: 0 },
-        ],
-      },
-      {
-        title: '③ 图片去重缓存',
-        desc: '仅单图无文本请求',
-        fields: [
-          { key: 'dedup_cache.enabled', label: '关卡：关闭时该级缓存直通', kind: 'bool' },
-          { key: 'dedup_cache.capacity', label: '容量上限（条目数，必填）', kind: 'int', min: 0 },
-          { key: 'dedup_cache.ttl', label: 'TTL（秒，必填）', kind: 'float', min: 0 },
-        ],
-      },
-      {
-        title: '④ 短文本 LLM 缓存',
-        fields: [
-          { key: 'short_text_llm_cache.enabled', label: '关卡：关闭时该级缓存直通', kind: 'bool' },
-          { key: 'short_text_llm_cache.capacity', label: '容量上限（条目数，必填）', kind: 'int', min: 0 },
-          { key: 'short_text_llm_cache.ttl', label: 'TTL（秒，必填）', kind: 'float', min: 0 },
-        ],
-      },
-      {
-        title: '⑤ 永久黑白名单',
-        fields: [
-          { key: 'permanent_lists', label: '启动加载，管理端写入即失效', kind: 'bool' },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'light_model',
-    title: '轻量文本风险模型',
-    icon: '⚡',
-    desc: '复用已训 fasttext.pt；路径为 null 时组件 disabled',
-    sections: [
-      {
-        title: '轻量模型',
-        fields: [
-          { key: 'model_path', label: 'fasttext.pt 路径', kind: 'text', nullable: true, hint: 'null = 未启用（组件 disabled）' },
-          { key: 'config_path', label: '模型配套 config.json 路径', kind: 'text', nullable: true, hint: 'null = 未启用' },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'logging',
-    title: '日志配置',
-    icon: '📝',
-    sections: [
-      {
-        title: '日志',
-        fields: [
-          {
-            key: 'level',
-            label: '日志级别（必填）',
-            kind: 'select',
-            options: ['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-          },
-          { key: 'json_lines', label: 'true = JSON 行；false = 标准文本格式', kind: 'bool' },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'image',
-    title: '图片处理（动图抽帧）',
-    icon: '🖼️',
-    sections: [
-      {
-        title: '动图抽帧',
-        fields: [
-          { key: 'animated.enabled', label: 'false 时退回 v0.1 首帧降级行为', kind: 'bool' },
-          { key: 'animated.frames', label: '均匀抽帧数（3~5，可配，必填）', kind: 'int', min: 1 },
-          {
-            key: 'animated.mode',
-            label: '抽帧模式（必填）',
-            kind: 'select',
-            options: ['uniform', 'first'],
-            hint: 'uniform 均匀 | first 首帧',
-          },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'keyword',
-    title: '关键词层',
-    icon: '🔑',
-    sections: [
-      {
-        title: '正则消歧规则库',
-        fields: [
-          { key: 'regex_rules_enabled', label: '开关；false 时规则层跳过', kind: 'bool' },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'semantic',
-    title: '语义层（Rerank 四信号）',
-    icon: '🧠',
-    desc: 'v0.2.1 新增 fuse_mode 图文融合模式（虚拟键，默认 pool）',
-    sections: [
-      {
-        title: '语义层',
-        fields: [
-          { key: 'rerank_enabled', label: 'Rerank 开关（默认关）', kind: 'bool' },
-          { key: 'rerank_w_top', label: '黑库最高相似度权重（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'rerank_w_margin', label: '黑白均值差权重（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'rerank_w_rerank', label: 'Rerank 分数权重（必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'rerank_top_k', label: 'Rerank 候选数（必填）', kind: 'int', min: 1 },
-          {
-            key: 'fuse_mode',
-            label: '图文融合模式（必填）',
-            kind: 'select',
-            options: ['pool', 'concat', 'weighted_avg'],
-            hint: 'weighted_avg 要求文本与图像向量同维；在线 API 与本地 CLIP 维度不一致时请用 concat（后端 422 校验提示）',
-          },
-        ],
-      },
-    ],
-  },
-  {
-    group: 'review',
-    title: '定时复核',
-    icon: '⏱️',
-    sections: [
-      {
-        title: '定时复核',
-        fields: [
-          { key: 'interval_min', label: '复核周期（分钟）；0 禁用自动调度（必填）', kind: 'int', min: 0 },
-          { key: 'band_low', label: '采样下界（置信度中带，必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'band_high', label: '采样上界（置信度中带，必填）', kind: 'float', min: 0, max: 1 },
-          { key: 'sample_size', label: '每轮采样上限（必填）', kind: 'int', min: 1 },
-          { key: 'auto_tune', label: '是否自动采纳阈值建议（默认仅出报告）', kind: 'bool' },
-        ],
-      },
-    ],
-  },
-]
-
 const toast = useToastStore()
 
 /** 分组 → 扁平字段值的编辑草稿（分组的二级对象以点分路径平铺，如 cache.redis.url） */
@@ -485,12 +117,23 @@ const channelResults = ref<Record<string, TestConnectionResult | null>>({})
 /** 正在测试的渠道（embedding / llm / fasttext），null 表示空闲 */
 const testingChannel = ref<string | null>(null)
 
-/** 模型卡状态（GET /admin/models）与下载任务（POST download → 轮询） */
-const models = ref<ModelsResponse | null>(null)
-const modelsLoading = ref(false)
-const downloadTask = ref<DownloadTask | null>(null)
-const downloadPolling = ref(false)
-const loadBusy = ref(false)
+/** 模型卡（T57c/F11：状态/轮询/下载/装配整体迁入 composables/useModelCard.ts） */
+const {
+  models,
+  modelsLoading,
+  downloadPolling,
+  loadBusy,
+  downloadProgressText,
+  downloadStageText,
+  vectorStoreReady,
+  clipStatusText,
+  fasttextStatusText,
+  clipStatusClass,
+  formatBytes,
+  loadModels,
+  startDownload,
+  loadModel,
+} = useModelCard()
 
 /** 改密表单（POST /admin/config/password） */
 const pwCurrent = ref('')
@@ -500,10 +143,6 @@ const pwSubmitting = ref(false)
 
 /** T38 跳转高亮：?group=xxx 落地分组卡后短暂描边（highlightGroup === 分组名） */
 const highlightGroup = ref<string | null>(null)
-
-/** 轮询句柄：模型状态 10s（页面活动时）/ 下载进度 1s（任务期间） */
-let modelsTimer: number | undefined
-let downloadTimer: number | undefined
 
 const GROUP_BY_KEY = new Map(GROUP_META.map((g) => [g.group, g]))
 
@@ -603,13 +242,6 @@ function connDetail(group: string): string {
   return parts.join(' · ')
 }
 
-/** 是否密钥遮蔽对象（{api_key_env, configured} 形态，config_override.mask_secret_fields 输出） */
-function isMaskedSecret(value: unknown): value is MaskedSecret {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const obj = value as Record<string, unknown>
-  return 'api_key_env' in obj && typeof obj.configured === 'boolean'
-}
-
 function secretOf(group: string, key: string): MaskedSecret | null {
   const value = draft.value[group]?.[key]
   return isMaskedSecret(value) ? value : null
@@ -617,11 +249,6 @@ function secretOf(group: string, key: string): MaskedSecret | null {
 
 function fieldValue(group: string, key: string): unknown {
   return draft.value[group]?.[key]
-}
-
-function textOf(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  return String(value)
 }
 
 function isOn(group: string, key: string): boolean {
@@ -660,131 +287,15 @@ function numberAttrs(meta: FieldMeta): Record<string, number | string> {
   return attrs
 }
 
-/** 未知分组的兜底字段类型探测：按当前值推断控件（bool/number/字符串/遮蔽对象） */
-function detectKind(value: unknown): FieldKind {
-  if (isMaskedSecret(value)) return 'secret'
-  if (typeof value === 'boolean') return 'bool'
-  if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'float'
-  return 'text'
-}
-
-/**
- * 兜底渲染未知分组（GROUP_META 未收录，如后端后续新增分组）：
- * - 以扁平字段的点分路径前缀分组为 section（"cache.audit_cache.enabled" → cache → audit_cache...）；
- * - 字段 label 兜底为「字段名 + 中文注释」；
- * - 类型按当前值探测（secret/bool/int/float/text），未知取值不做枚举猜测。
- * 已知分组永远走 GROUP_META 静态元数据，不会命中此分支。
- */
-function synthesizeGroup(group: string, flat: Record<string, unknown>): GroupMeta {
-  const sections: SectionMeta[] = []
-  const sectionMap = new Map<string, FieldMeta[]>()
-  const topLevel: FieldMeta[] = []
-  for (const [key, value] of Object.entries(flat)) {
-    const field: FieldMeta = { key, label: `（未知分组字段，类型自动识别）${key}`, kind: detectKind(value) }
-    const first = key.split('.')[0] ?? ''
-    if (key.includes('.')) {
-      if (!sectionMap.has(first)) sectionMap.set(first, [])
-      sectionMap.get(first)?.push(field)
-    } else {
-      topLevel.push(field)
-    }
-  }
-  if (topLevel.length > 0) sections.push({ title: '顶层字段', fields: topLevel })
-  for (const [title, fields] of sectionMap) {
-    sections.push({ title, fields })
-  }
-  return {
-    group,
-    title: group,
-    icon: '🧩',
-    desc: '后端返回了未收录到 GROUP_META 的分组（配置源码可能已更新）——按响应值自动获取类型渲染；请同步补充字段映射表',
-    sections,
-    synthetic: true,
-  }
-}
-
 /**
  * 渲染分组清单：以 GET /admin/config 实际返回的分组为准（决策：按响应渲染），
  * 已知分组取 GROUP_META 静态元数据（label/类型/枚举/范围），未知分组走
- * synthesizeGroup 自动降级。后端分组白名单与其模型字段同步演进时页面不破。
+ * synthesizeGroup 自动降级（纯函数见 configForm.ts）。后端分组白名单与其模型
+ * 字段同步演进时页面不破。
  */
 const renderGroups = computed<GroupMeta[]>(() => {
   return Object.keys(draft.value).map((group) => GROUP_BY_KEY.get(group) ?? synthesizeGroup(group, draft.value[group]))
 })
-
-/** 构造提交负载：全量非密钥字段；空可空字段转 null；空必填/非法数值前端拦截 */
-function buildPayload(group: string): Record<string, unknown> | null {
-  const meta = renderGroups.value.find((g) => g.group === group)
-  if (!meta) return null
-  const payload: Record<string, unknown> = {}
-  for (const section of meta.sections) {
-    for (const field of section.fields) {
-      if (field.kind === 'secret') continue // 密钥不参与提交（后端对 api_key 键一律 422）
-      const value = fieldValue(group, field.key)
-      if (value === null || value === undefined || value === '') {
-        if (field.nullable) {
-          setNested(payload, field.key, null)
-          continue
-        }
-        toast.error(`字段 ${group}.${field.key} 不能为空（必填项）`)
-        return null
-      }
-      if (field.kind === 'bool') {
-        setNested(payload, field.key, value === true || value === 'true')
-      } else if (field.kind === 'int') {
-        const num = Number(value)
-        if (!Number.isInteger(num)) {
-          toast.error(`字段 ${group}.${field.key} 必须为整数`)
-          return null
-        }
-        setNested(payload, field.key, num)
-      } else if (field.kind === 'float') {
-        const num = Number(value)
-        if (Number.isNaN(num)) {
-          toast.error(`字段 ${group}.${field.key} 必须为数字`)
-          return null
-        }
-        setNested(payload, field.key, num)
-      } else {
-        setNested(payload, field.key, textOf(value))
-      }
-    }
-  }
-  return payload
-}
-
-/** 点分路径写入嵌套对象（如 'cloud.base_url' → payload.cloud.base_url） */
-function setNested(target: Record<string, unknown>, dotted: string, value: unknown): void {
-  const parts = dotted.split('.')
-  let node = target
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    const key = parts[i]
-    if (typeof node[key] !== 'object' || node[key] === null || Array.isArray(node[key])) {
-      node[key] = {}
-    }
-    node = node[key] as Record<string, unknown>
-  }
-  node[parts[parts.length - 1]] = value
-}
-
-/** flattenGroup 的辅助：把后端返回的分组（含嵌套对象/遮蔽密钥）平铺为点分路径 */
-function flattenGroup(raw: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {}
-  const walk = (node: Record<string, unknown>, prefix: string): void => {
-    for (const [key, value] of Object.entries(node)) {
-      const path = prefix ? `${prefix}.${key}` : key
-      if (isMaskedSecret(value)) {
-        out[path] = value // 遮蔽对象整体保留（徽标展示），不参与提交
-      } else if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-        walk(value as Record<string, unknown>, path)
-      } else {
-        out[path] = value
-      }
-    }
-  }
-  walk(raw, '')
-  return out
-}
 
 /** 拉取全量配置并重建草稿（刷新按钮/初始加载共用） */
 async function loadConfig(): Promise<void> {
@@ -810,11 +321,18 @@ async function loadConfig(): Promise<void> {
 
 /** 保存单个分组：PUT /admin/config/{group}，成功以响应 config 回填草稿 + 内联 sources 刷新徽标 */
 async function saveGroup(group: string): Promise<void> {
-  const payload = buildPayload(group)
-  if (!payload) return
+  const meta = renderGroups.value.find((g) => g.group === group)
+  if (!meta) return
+  // buildPayload 纯化（configForm.ts）：错误经 { ok:false, error } 返回，此处弹 Toast
+  // （与拆分前「toast.error 首条错误并中止」行为一致）
+  const built = buildPayload(meta, draft.value[group] ?? {})
+  if (!built.ok) {
+    toast.error(built.error)
+    return
+  }
   savingGroup.value = group
   try {
-    const res = await apiPut<ConfigPutResult>(`/config/${group}`, payload)
+    const res = await apiPut<ConfigPutResult>(`/config/${group}`, built.payload)
     if (res.config) draft.value[group] = flattenGroup(res.config)
     if (res.sources) sources.value[group] = res.sources // 保存响应内联 sources → 徽标即时更新
     toast.success(saveMessage(res, false))
@@ -851,162 +369,6 @@ const restoreMessage = computed(() => {
     ? `确定将分组「${groupTitle(group)}」恢复为默认配置吗？\n将删除该分组的管理端配置（DB settings）并立即生效（热应用）；端口/日志类配置于下次启动生效。`
     : ''
 })
-
-// ------------------------------------------------ T39：模型卡（M6）
-
-/** 字节数人类可读（null/undefined/非有限数 → ''） */
-function formatBytes(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return ''
-  if (value < 1024) return `${value} B`
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`
-}
-
-/** chinese-clip 状态徽标文案（api/admin.py list_models 的 clip.status） */
-const CLIP_STATUS_TEXT: Record<string, string> = {
-  ready: '已就绪',
-  downloading: '下载中',
-  not_downloaded: '未下载',
-  error: '错误',
-  cloud: '云端',
-}
-
-/** fasttext 状态徽标文案（fasttext.status） */
-const FASTTEXT_STATUS_TEXT: Record<string, string> = {
-  ready: '已就绪',
-  error: '加载错误',
-  missing: '文件缺失',
-  not_configured: '未配置',
-}
-
-/** chinese-clip 状态 → 徽标文案（缺省 '—'） */
-function clipStatusText(status: string | undefined): string {
-  if (!status) return '—'
-  return CLIP_STATUS_TEXT[status] ?? status
-}
-
-/** fasttext 状态 → 徽标文案（缺省 '—'） */
-function fasttextStatusText(status: string | undefined): string {
-  if (!status) return '—'
-  return FASTTEXT_STATUS_TEXT[status] ?? status
-}
-
-/** chinese-clip 状态 → 徽标样式类（语义色） */
-function clipStatusClass(status: string | undefined): string {
-  if (status === 'ready') return 'm-badge-ok'
-  if (status === 'error') return 'm-badge-err'
-  if (status === 'downloading') return 'm-badge-warn'
-  if (status === 'cloud') return 'm-badge-alt'
-  return 'm-badge-muted' // not_downloaded / 缺省
-}
-
-/** 向量库黑白池任一非空即视为已就绪 */
-const vectorStoreReady = computed(() => {
-  const vs = models.value?.vector_store
-  return Boolean(vs && (vs.black.count > 0 || vs.white.count > 0))
-})
-
-/** 下载进度文案（running 时显示百分比，其余状态空串） */
-const downloadProgressText = computed(() => {
-  const task = downloadTask.value
-  if (!task || task.status !== 'running') return ''
-  return task.progress !== undefined ? `进度 ${task.progress}%` : '准备中...'
-})
-
-/** 下载阶段（stage），无则空串 */
-const downloadStageText = computed(() => downloadTask.value?.stage ?? '')
-
-/** 拉取模型状态（GET /admin/models）；页面活动时由 10s 轮询调用 */
-async function loadModels(): Promise<void> {
-  modelsLoading.value = true
-  try {
-    models.value = await apiGet<ModelsResponse>('/models')
-  } catch (error) {
-    console.warn('[SettingsView] 加载模型状态失败：', error)
-  } finally {
-    modelsLoading.value = false
-  }
-}
-
-/** 「⬇️ 下载模型」：POST /admin/models/download → 复用/新任务 → 1s 轮询进度 */
-async function startDownload(): Promise<void> {
-  if (downloadPolling.value) return
-  try {
-    const res = await apiPost<{
-      task_id: string
-      status: string
-      reused?: boolean
-      message?: string
-    }>('/models/download', {})
-    if (res.status === 'completed') {
-      toast.success('模型已缓存，无需下载')
-      void loadModels()
-      return
-    }
-    downloadPolling.value = true
-    downloadTask.value = { task_id: res.task_id, status: 'running' }
-    toast.info(res.reused ? '复用进行中的下载任务（同模型互斥）' : '下载任务已启动')
-    pollDownload(res.task_id)
-  } catch (error) {
-    console.warn('[SettingsView] 启动模型下载失败：', error)
-  }
-}
-
-/** 下载进度轮询：GET /admin/models/download/{task_id}，completed/failed 收尾 */
-function pollDownload(taskId: string): void {
-  if (downloadTimer !== undefined) window.clearInterval(downloadTimer)
-  downloadTimer = window.setInterval(async () => {
-    try {
-      const task = await apiGet<DownloadTask>(`/models/download/${taskId}`)
-      downloadTask.value = task
-      if (task.status === 'completed') {
-        finishDownload(true, '模型下载完成，可点击「装配 / 重新加载」启用')
-      } else if (task.status === 'failed') {
-        finishDownload(false, `模型下载失败：${task.error || '未知错误'}`)
-      }
-    } catch (error) {
-      console.warn('[SettingsView] 轮询下载进度失败：', error)
-      finishDownload(false, '下载进度查询失败，请刷新页面查看模型状态')
-    }
-  }, 1000)
-}
-
-/** 下载收尾：停止轮询 → Toast → 刷新模型状态 */
-function finishDownload(ok: boolean, message: string): void {
-  if (downloadTimer !== undefined) {
-    window.clearInterval(downloadTimer)
-    downloadTimer = undefined
-  }
-  downloadPolling.value = false
-  if (ok) toast.success(message)
-  else toast.error(message)
-  void loadModels()
-}
-
-/** 「🔄 装配 / 重新加载」：POST /admin/models/load（同步等待装配结果） */
-async function loadModel(): Promise<void> {
-  if (loadBusy.value) return
-  loadBusy.value = true
-  try {
-    const res = await apiPost<{
-      status: string
-      message?: string
-      reason?: string | null
-      semantic_ready?: boolean
-      duration_s?: number | null
-    }>('/models/load', {})
-    if (res.status === 'ok') {
-      toast.success(`语义层装配成功${res.duration_s != null ? `（${String(res.duration_s)}s）` : ''}`)
-    } else {
-      toast.error(res.message || res.reason || '装配失败')
-    }
-    void loadModels()
-  } catch (error) {
-    console.warn('[SettingsView] 装配模型失败：', error)
-  } finally {
-    loadBusy.value = false
-  }
-}
 
 // ------------------------------------------------ T39：安全卡（M9 C5 改密）
 
@@ -1050,11 +412,6 @@ async function changePassword(): Promise<void> {
   }
 }
 
-/** 页面回到前台时立即刷新模型状态（配合 10s 轮询的 document.hidden 跳过） */
-function onVisibilityChange(): void {
-  if (!document.hidden) void loadModels()
-}
-
 /**
  * T38 协作：概览页「系统状态」徽标点击跳转带 ?group=xxx（embedding/llm/
  * light_model/semantic/keyword），本页消费 query——等配置草稿渲染完成后滚动到
@@ -1081,18 +438,6 @@ async function refreshAll(): Promise<void> {
 onMounted(() => {
   void loadConfig().then(() => handleGroupQuery())
   void loadSources()
-  void loadModels()
-  // 页面活动时每 10s 轮询模型状态（隐藏时跳过，回前台即刷）
-  modelsTimer = window.setInterval(() => {
-    if (!document.hidden) void loadModels()
-  }, 10000)
-  document.addEventListener('visibilitychange', onVisibilityChange)
-})
-
-onUnmounted(() => {
-  if (modelsTimer !== undefined) window.clearInterval(modelsTimer)
-  if (downloadTimer !== undefined) window.clearInterval(downloadTimer)
-  document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>
 
@@ -1110,7 +455,7 @@ onUnmounted(() => {
       环境变量注入（值不回显）。字段旁小徽标 = 当前生效来源。
     </p>
 
-    <!-- 模型卡（v0.3.0 M6：按需下载 / 装配 / 状态，独立于分组表单） -->
+    <!-- 模型卡（v0.3.0 M6：按需下载 / 装配 / 状态，独立于分组表单；状态机迁入 useModelCard） -->
     <div class="card model-card">
       <div class="card-title model-title">
         <span>🤖 模型</span>
@@ -1210,8 +555,13 @@ onUnmounted(() => {
             {{ vectorStoreReady ? '已就绪' : '为空' }}
           </span>
           <div class="model-detail">
+            <span v-if="models?.vector_store?.name">当前库：{{ models?.vector_store?.name }}</span>
+            <span v-if="models?.vector_store?.path" class="dl-muted">路径 {{ models?.vector_store?.path }}</span>
             <span>黑池 {{ models?.vector_store?.black.count ?? 0 }} 条（{{ models?.vector_store?.black.dim ?? '—' }} 维）</span>
             <span>白池 {{ models?.vector_store?.white.count ?? 0 }} 条（{{ models?.vector_store?.white.dim ?? '—' }} 维）</span>
+            <span v-if="models?.vector_store?.available?.length" class="dl-muted">
+              可用库：{{ models?.vector_store?.available.join(' / ') }}
+            </span>
           </div>
           <div class="model-actions"></div>
         </div>
@@ -1332,6 +682,27 @@ onUnmounted(() => {
                   </button>
                   <span class="bool-text">{{ isOn(meta.group, field.key) ? '开' : '关' }}</span>
                 </div>
+              </template>
+
+              <!-- JSON 数组/对象编辑（providers / vector_stores 等） -->
+              <template v-else-if="field.kind === 'json'">
+                <span class="field-label-row">
+                  <span class="field-label">{{ field.label }}</span>
+                  <span
+                    class="src-badge"
+                    :class="srcBadgeClass(meta.group, field.key)"
+                    :title="`来源：${sourceText(sourceOf(meta.group, field.key))}`"
+                  >
+                    {{ sourceText(sourceOf(meta.group, field.key)) }}
+                  </span>
+                </span>
+                <textarea
+                  class="input json-textarea"
+                  rows="6"
+                  :value="textOf(fieldValue(meta.group, field.key))"
+                  :placeholder="field.nullable ? '留空 = null（未配置）' : ''"
+                  @input="onTextInput(meta.group, field.key, $event)"
+                ></textarea>
               </template>
 
               <!-- 数字输入 -->
@@ -1672,6 +1043,16 @@ onUnmounted(() => {
   line-height: 1.5;
 }
 
+/* JSON 数组/对象编辑（providers / vector_stores） */
+.json-textarea {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 96px;
+  white-space: pre;
+}
+
 /* 开关（switch，风格对齐 RulesView） */
 .bool-row {
   display: flex;
@@ -1727,24 +1108,10 @@ onUnmounted(() => {
   justify-content: center;
 }
 
+/* F4③：.tag 系已全局化于 style.css（自本页收敛，含暗色变量适配）；
+   此处仅保留本页差异覆盖——密钥徽标在纵向 flex 容器内需顶部对齐 */
 .tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
   align-self: flex-start;
-}
-
-.tag-success {
-  background: var(--success-light);
-  color: var(--success);
-}
-
-.tag-orange {
-  background: #fff7e8;
-  color: #b5711a;
 }
 
 .secret-note {

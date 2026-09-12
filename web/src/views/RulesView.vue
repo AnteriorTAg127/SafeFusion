@@ -20,6 +20,13 @@
  * 已知后端缺口（写入报告 TODO）：
  * - 后端无「仅停用」过滤（active_only 只有 true/false 两个语义）→ 「停用」态
  *   以 active_only=false 拉全量后客户端过滤 is_active=false。
+ *
+ * T57a/F2：
+ * - 导入/新增走 SLOW_TIMEOUT_MS（120s）：大规则文件导入可能 >15s，
+ *   原全局 15s 超时会造成「前端假失败而后端已写库」→ 重复导入脏数据；
+ *   超时专属 Toast 提示「请勿重复提交」（client.ts F2）。
+ * - submitting 态复核：新增/导入期间「提交/导入/取消」按钮禁用防双击重复提交。
+ *   （/admin/rules 无分页参数 → 无需 fetchAllPaged 收敛，保持单次全量拉取。）
  */
 import { onMounted, ref } from 'vue'
 import DataTable from '../components/DataTable.vue'
@@ -27,7 +34,8 @@ import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 import AppModal from '../components/AppModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
-import { apiGet, apiPost, apiPatch, apiDelete } from '../api/client'
+import { apiGet, apiPost, apiPatch, apiDelete, SLOW_TIMEOUT_MS } from '../api/client'
+import { fmtTime, textOf } from '../utils/format'
 import { useToastStore } from '../stores/toast'
 
 interface RulesResponse {
@@ -73,17 +81,6 @@ const formNote = ref('')
 
 // ---------- 导入 ----------
 const importFile = ref<HTMLInputElement | null>(null)
-
-function textOf(value: unknown): string {
-  return value === null || value === undefined ? '' : String(value)
-}
-
-function fmtTime(ts: unknown): string {
-  const s = textOf(ts)
-  if (!s) return '—'
-  const d = new Date(s)
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString()
-}
 
 function isActive(row: RuleRow): boolean {
   return row.is_active === true || row.is_active === 1
@@ -183,6 +180,7 @@ async function submitForm(): Promise<void> {
   }
   submitting.value = true
   try {
+    // 新增规则经 POST JSON 数组；大文件/慢盘可能 >15s → 120s 慢超时（F2）
     const res = await apiPost<RulesWriteResult>('/rules', [
       {
         category: formCategory.value.trim(),
@@ -190,7 +188,7 @@ async function submitForm(): Promise<void> {
         action,
         note: formNote.value.trim() || null,
       },
-    ])
+    ], undefined, { timeoutMs: SLOW_TIMEOUT_MS })
     toast.success(`已新增 ${res.inserted} 条规则${res.skipped ? `，跳过重复 ${res.skipped} 条` : ''}`)
     showForm.value = false
     page.value = 1
@@ -227,12 +225,13 @@ async function importRules(): Promise<void> {
         toast.error('JSON 必须是规则对象数组 [{category, pattern, action, note}]')
         return
       }
-      res = await apiPost<RulesWriteResult>('/rules', payload)
+      res = await apiPost<RulesWriteResult>('/rules', payload, undefined, { timeoutMs: SLOW_TIMEOUT_MS })
     } else {
       // CSV/TXT：multipart file 字段（后端按 CSV category,pattern,action 解析）
       const fd = new FormData()
       fd.append('file', file)
-      res = await apiPost<RulesWriteResult>('/rules', fd)
+      // 大规则文件导入可能 >15s → 120s 慢超时（F2）
+      res = await apiPost<RulesWriteResult>('/rules', fd, undefined, { timeoutMs: SLOW_TIMEOUT_MS })
     }
     toast.success(`导入完成：新增 ${res.inserted} 条${res.skipped ? `，跳过重复 ${res.skipped} 条` : ''}`)
     if (importFile.value) importFile.value.value = ''
@@ -540,25 +539,7 @@ const columns = [
   word-break: break-all;
 }
 
-/* action 标签 */
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.tag-danger {
-  background: var(--danger-light);
-  color: var(--danger);
-}
-
-.tag-success {
-  background: var(--success-light);
-  color: var(--success);
-}
+/* action 标签（tag 系已全局化于 style.css，F4③） */
 
 /* 启用开关（switch） */
 .switch {

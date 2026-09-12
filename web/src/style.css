@@ -29,6 +29,7 @@
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08);
   --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   /* ---- T35 语义令牌（浅色值 = 收敛前的字面量，供 scoped 样式 var() 使用） ---- */
+  --purple: #722ed1; /* tag-purple 文字（新增令牌，对齐 --purple-light 底色） */
   --purple-light: #f5e8ff; /* StatCard stat-purple 图标底色 */
   --orange-light: #fff7e8; /* StatCard stat-orange / tag-orange 底色 */
   --orange: #b5711a; /* tag-orange 文字 */
@@ -60,6 +61,7 @@
   /* 阴影加深以在深色底保持层次 */
   --shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.55);
+  --purple: #b37feb; /* tag-purple 文字（暗色提亮一档） */
   --purple-light: #2a2140;
   --orange-light: #35291a;
   --orange: #e3a04b;
@@ -352,6 +354,57 @@ body {
   }
 }
 
+/* ---------- 标签 / 等宽字体（F4③ 全局化：自 Audit/Trial/Keywords/Rules/Review/Settings/EvidencePanel
+ * 七处 scoped 逐字复制的并集收敛；全部走 CSS 变量，浅/暗色自动适配。
+ * 语义说明：tag 为通用徽标底；tag-success/danger/blue/gray/orange/purple 为语义色。
+ * 原 ReviewView/SettingsView 的 tag-orange 用浅色字面量 #fff7e8/#b5711a（与令牌
+ * 浅色值一致），本次一并改为 var(--orange-light)/var(--orange)，暗色自动生效；
+ * 删除 style.css 底部 :root[data-theme='dark'] .tag-orange 覆盖（已并入本块）。） ---------- */
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tag-success {
+  background: var(--success-light);
+  color: var(--success);
+}
+
+.tag-danger {
+  background: var(--danger-light);
+  color: var(--danger);
+}
+
+.tag-blue {
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.tag-gray {
+  background: var(--surface-hover);
+  color: var(--text-3);
+}
+
+.tag-orange {
+  background: var(--orange-light);
+  color: var(--orange);
+}
+
+.tag-purple {
+  background: var(--purple-light);
+  color: var(--purple);
+}
+
+.mono {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.76rem;
+  word-break: break-all;
+}
+
 /* ---------- 深色覆盖（scoped 样式字面量的暗色适配，T35 报告收敛清单） ----------
  * 收敛策略：能直接改的（style.css 自身 / StatCard.vue 等无并行编辑的文件）一律
  * 改为 var()；以下两处字面量位于 T36 并行编辑的视图（ReviewView/SettingsView），
@@ -359,11 +412,6 @@ body {
  * 令牌（--orange-light/--orange/--code-bg），亮色仍走视图内原有字面量（与令牌
  * 浅色值一致）。:root 前缀保证特异性 (0,3,0) 高于 scoped 选择器 (0,2,0)，
  * 与样式注入顺序无关。 */
-:root[data-theme='dark'] .tag-orange {
-  background: var(--orange-light);
-  color: var(--orange);
-}
-
 :root[data-theme='dark'] .restart-desc code {
   background: var(--code-bg);
 }

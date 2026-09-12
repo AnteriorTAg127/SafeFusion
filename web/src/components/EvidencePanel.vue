@@ -18,6 +18,7 @@
 import { computed } from 'vue'
 import type { AuditDetail, AuditResult, KeywordHit, RegexFilteredHit } from '../api/types'
 import JsonTree from '../views/components/JsonTree.vue'
+import { sourceLabel } from '../utils/format'
 
 const props = withDefaults(
   defineProps<{
@@ -25,30 +26,25 @@ const props = withDefaults(
     result: AuditResult | null
     /** 审核中（渲染 loading 占位，不展示旧结果） */
     loading?: boolean
-    /** 本次审核前端实测耗时（ms；0 渲染 —） */
+    /**
+     * 本次审核前端实测耗时（ms；0 渲染 —）。
+     * 口径（F8）：TrialView 自发送前（含前端 base64 编码/上传）计时至响应返回，
+     * **含前端编码/上传开销**，与后端日志 duration 同数量级但略大；
+     * 后端响应体未提供耗时字段，故保留前端实测值并明示口径。
+     */
     durationMs?: number
   }>(),
   { loading: false, durationMs: 0 },
 )
 
 // ---------- 判定总览 ----------
-/** 判定来源 → 中文（schemas.Source 五值 + 兜底原文） */
-const SOURCE_LABELS: Record<string, string> = {
-  semantic: '语义层',
-  llm: 'LLM 兜底',
-  basic_rules_pass: '基础规则放行',
-  cache: '缓存命中',
-  permanent_list: '永久黑白名单',
-}
+// SOURCE_LABELS 自 utils/format 收敛（F4②；本文件头注释同步更新为共享来源）
+const sourceText = computed(() => sourceLabel(props.result?.source))
 
-const sourceText = computed(() => {
-  const src = props.result?.source
-  return src ? (SOURCE_LABELS[src] ?? src) : '—'
+const durationText = computed(() => {
+  if (props.durationMs <= 0) return '—'
+  return `${Math.round(props.durationMs)} ms（含前端编码/上传）`
 })
-
-const durationText = computed(() =>
-  props.durationMs > 0 ? `${Math.round(props.durationMs)} ms` : '—',
-)
 
 const timeText = computed(() => {
   const ts = props.result?.timestamp ?? ''
@@ -488,40 +484,5 @@ function shortId(id: string): string {
   margin-top: 10px;
   padding-top: 10px;
   border-top: 1px dashed var(--border);
-}
-
-/* ---------- 标签（审计侧同名语义；自含避免依赖视图 scoped 类） ---------- */
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.tag-danger {
-  background: var(--danger-light);
-  color: var(--danger);
-}
-
-.tag-success {
-  background: var(--success-light);
-  color: var(--success);
-}
-
-.tag-blue {
-  background: var(--primary-light);
-  color: var(--primary);
-}
-
-.tag-gray {
-  background: var(--surface-hover);
-  color: var(--text-3);
-}
-
-.mono {
-  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-  font-size: 0.72rem;
 }
 </style>

@@ -26,6 +26,7 @@ import { onMounted, ref } from 'vue'
 import StatCard from '../components/StatCard.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { apiGet, apiPost } from '../api/client'
+import { fmtTime, textOf } from '../utils/format'
 import { useToastStore } from '../stores/toast'
 
 /** GET /admin/review/status 响应结构（core/review.py status()） */
@@ -53,15 +54,12 @@ const status = ref<ReviewStatus | null>(null)
 const loading = ref(false)
 const running = ref(false)
 
-function textOf(value: unknown): string {
-  return value === null || value === undefined ? '' : String(value)
-}
-
-function fmtTime(ts: unknown): string {
-  const s = textOf(ts)
-  if (!s) return '从未运行'
-  const d = new Date(s)
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString()
+/**
+ * 上次运行时间：空 → 页面专属文案「从未运行」（区别于共享 fmtTime 的 '—'；
+ * F4② 差异点留在调用方，见 utils/format.ts 文件头说明）。
+ */
+function fmtLastRun(ts: unknown): string {
+  return textOf(ts) ? fmtTime(ts) : '从未运行'
 }
 
 /** 一致率 → 百分数文本 */
@@ -158,7 +156,7 @@ onMounted(() => {
         label="复核调度"
         tone="blue"
       />
-      <StatCard icon="🕒" :value="status ? fmtTime(status.last_run_ts) : '…'" label="上次运行时间" tone="green" />
+      <StatCard icon="🕒" :value="status ? fmtLastRun(status.last_run_ts) : '…'" label="上次运行时间" tone="green" />
       <StatCard
         icon="🔄"
         :value="status ? (status.running ? '运行中' : '空闲') : '…'"
@@ -309,12 +307,6 @@ onMounted(() => {
   font-weight: 600;
 }
 
-.mono {
-  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-  font-size: 0.76rem;
-  word-break: break-all;
-}
-
 .sub-title {
   font-size: 0.8rem;
   font-weight: 700;
@@ -323,25 +315,6 @@ onMounted(() => {
 }
 
 /* 标签 / 芯片 */
-.tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.tag-blue {
-  background: var(--primary-light);
-  color: var(--primary);
-}
-
-.tag-orange {
-  background: #fff7e8;
-  color: #b5711a;
-}
-
 .chip {
   display: inline-block;
   padding: 2px 8px;

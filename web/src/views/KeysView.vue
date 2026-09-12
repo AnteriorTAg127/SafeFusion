@@ -25,11 +25,12 @@
  * 1. api_keys 表无 last_used / rate_limit 列 → 列表「最近使用」恒为「—」；按 Key
  *    独立限流不可配，当前为全局固定 60 次 / 60 秒（app.py KeyRateLimiter，环境变量
  *    SAFEFUSION_RATE_LIMIT 整体调整，非按 Key）→「限流」列亦为「—」（title 提示真实策略）。
- * 2. PATCH/DELETE 路径参数需要完整 Key 明文，而 GET 列表只返回脱敏前缀 → 前端对
- *    「非本会话新建」的 Key 无法定位。本页对「本会话新建的 Key」用内存暂存的完整明文
- *    （不落盘、不持久化、不打印、不进日志，红线遵守）完成停用/删除；其余 Key 待后端
- *    补强（建议：PATCH/DELETE 支持脱敏前缀唯一匹配，或 GET 额外返回稳定非敏感标识）
- *    后自动全量生效——统一收敛在 keyRefFor()，见文件头 TODO 注释。
+ * 2. PATCH/DELETE 路径参数支持完整 Key 明文或列表脱敏前缀（admin.py:543
+ *    `_resolve_key_ref` 精确匹配优先、前缀唯一匹配兜底，前缀多条命中 400 / 零命中
+ *    404）——非本会话新建的 Key 亦可用脱敏前缀停用/删除（F4④ 已对照 admin.py
+ *    <2026-08-29>）；本页仍保留内存明文路径：仅「本会话新建」走完整明文
+ *    （不落盘、不持久化、不打印、不进日志，红线遵守），其余行统一经 keyRefFor()
+ *    收敛，无需按来源分支。
  */
 import { computed, onMounted, ref } from 'vue'
 import DataTable from '../components/DataTable.vue'
@@ -38,6 +39,8 @@ import Pagination from '../components/Pagination.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import AppModal from '../components/AppModal.vue'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../api/client'
+import { fmtTime, textOf } from '../utils/format'
+import { keyRefFor, maskOf } from '../utils/keyRef'
 import { useToastStore } from '../stores/toast'
 
 /** POST /admin/keys 创建成功响应（完整 Key 明文仅此一次返回） */
@@ -76,42 +79,18 @@ const createdKey = ref<{ full: string } | null>(null)
 const disabling = ref<KeysRow | null>(null)
 const deleting = ref<KeysRow | null>(null)
 
-// ---------- 取值辅助（DataTable 单元格值为 unknown，统一收敛） ----------
-function textOf(value: unknown): string {
-  return value === null || value === undefined ? '' : String(value)
-}
-
+// ---------- 取值辅助（DataTable 单元格值为 unknown，统一收敛自 utils/format） ----------
 function boolOf(value: unknown): boolean {
   return value === true || value === 1 || textOf(value).toLowerCase() === 'true'
 }
 
-/** 创建时间（ISO）→ 本地化显示 */
-function fmtTime(value: unknown): string {
-  const s = textOf(value)
-  if (!s) return '—'
-  const d = new Date(s)
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString()
-}
-
-/** 脱敏规则与后端 admin.py _mask_key 一致（key[:8] + "…"）：用于把本会话新建
- *  Key 的明文与列表行（脱敏前缀）匹配。 */
-function maskOf(fullKey: string): string {
-  return `${fullKey.slice(0, 8)}…`
-}
-
 /**
  * 解析某行可用的管理标识（PATCH/DELETE 路径参数）。
- * 后端 GET 列表仅返回脱敏前缀而 PATCH/DELETE 需要完整 Key 明文 → 本会话新建的
- * Key 走内存暂存的明文；其余行暂以脱敏前缀请求（当前后端将 404，见文件头 TODO #2，
- * 后端补强为前缀唯一匹配 / 稳定标识后此处自动全量生效，无需改动调用点）。
+ * 后端 _resolve_key_ref（admin.py:543）支持完整明文或脱敏前缀唯一匹配（F4④）：
+ * 本会话新建的 Key 走内存暂存的完整明文；其余行直接以脱敏前缀请求即可命中。
+ * 纯逻辑已收敛至 utils/keyRef.ts（maskOf / keyRefFor，F12 直测），此处仅接线。
  */
-function keyRefFor(row: KeysRow): string {
-  const prefix = textOf(row.key)
-  if (createdKey.value && prefix === maskOf(createdKey.value.full)) {
-    return createdKey.value.full
-  }
-  return prefix
-}
+
 
 // ---------- 数据加载（GET /admin/keys 无分页参数 → 全量后客户端分页） ----------
 async function loadData(): Promise<void> {
@@ -203,7 +182,7 @@ async function confirmDisable(): Promise<void> {
   const row = disabling.value
   if (!row) return
   try {
-    await apiPatch<KeysRow>(`/keys/${encodeURIComponent(keyRefFor(row))}`, { enabled: false })
+    await apiPatch<KeysRow>(`/keys/${encodeURIComponent(keyRefFor(textOf(row.key), createdKey.value?.full ?? null))}`, { enabled: false })
     toast.success('已停用该 Key（相关调用方将失效）')
     await loadData()
   } catch (error) {
@@ -216,7 +195,7 @@ async function confirmDisable(): Promise<void> {
 /** 启用无副作用，直接执行（不停用那样需要二次确认） */
 async function enableKey(row: KeysRow): Promise<void> {
   try {
-    await apiPatch<KeysRow>(`/keys/${encodeURIComponent(keyRefFor(row))}`, { enabled: true })
+    await apiPatch<KeysRow>(`/keys/${encodeURIComponent(keyRefFor(textOf(row.key), createdKey.value?.full ?? null))}`, { enabled: true })
     toast.success('已启用该 Key')
     await loadData()
   } catch (error) {
@@ -233,7 +212,7 @@ async function confirmDelete(): Promise<void> {
   const row = deleting.value
   if (!row) return
   try {
-    await apiDelete(`/keys/${encodeURIComponent(keyRefFor(row))}`)
+    await apiDelete(`/keys/${encodeURIComponent(keyRefFor(textOf(row.key), createdKey.value?.full ?? null))}`)
     toast.success('API Key 已删除')
     // 删除的正是本会话新建的 Key → 内存明文一并清除（不再需要）
     if (createdKey.value && textOf(row.key) === maskOf(createdKey.value.full)) {
