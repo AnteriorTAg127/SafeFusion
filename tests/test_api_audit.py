@@ -156,7 +156,7 @@ class TestHealth:
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "ok"
-        assert body["version"] == "0.1.0"
+        assert body["version"] == "0.4.0"
         degraded = body["degraded"]
         assert "llm" in degraded  # 密钥未配置恒降级
         # PRD v0.3.0 M6 懒加载：build 不装载模型 → embedding/semantic 恒为
@@ -237,7 +237,7 @@ class TestAppContextBuild:
         assert ctx.database is not None
         assert ctx.cache_layer is not None
         assert ctx.keyword_engine is not None and ctx.keyword_engine.loaded
-        assert ctx.store is not None
+        assert ctx.ensure_current_store() is not None
         assert ctx.whitelist is not None
         assert ctx.light_model is not None and ctx.light_model.disabled is True
         # PRD v0.3.0 M6 懒加载：build 永不装载模型（不触网 / 不实例化），
