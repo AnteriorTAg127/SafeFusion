@@ -34,7 +34,7 @@
 import re
 import threading
 from collections.abc import Iterable
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import ahocorasick
 from pypinyin import Style, lazy_pinyin
@@ -427,23 +427,34 @@ def _han_count(text: str) -> int:
     return sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
 
 
+def _parse_and_rule(word: str) -> tuple[str, list[str]] | None:
+    """判断词条是否为 ``+`` 组合词，返回 (原始词, term 列表)；非组合返回 None。"""
+    parts = [p.strip() for p in word.split("+") if p.strip()]
+    if len(parts) > 1:
+        return word, parts
+    return None
+
+
 def _build_automaton(
     categories: dict[str, list[str]],
-) -> tuple[ahocorasick.Automaton | None, int]:
+) -> tuple[ahocorasick.Automaton | None, int, list[dict[str, Any]]]:
     """按类别词库构建 Aho-Corasick 自动机（变体全部展开进自动机）。
+
+    ``+`` 组合词（AND）不整体进自动机：每个 term 以 ``and_term`` 标记进自动机，
+    同时返回组合规则列表供 :meth:`KeywordEngine.scan` 做「全部 term 命中」判定。
 
     Args:
         categories: 类别名 → 该类别关键词列表。
 
     Returns:
-        ``(自动机, 变体总数)``；词库为空时自动机为 None（scan 依空值守卫返回
-        空命中，与既有 load_categories 空词库语义一致，主模型集成修复
-        2026-08-26 修复 T10 报告缺陷①）。
+        ``(自动机, 变体总数, and_rules)``；词库为空时自动机为 None（scan 依空值
+        守卫返回空命中，与既有 load_categories 空词库语义一致）。
     """
 
     automaton = ahocorasick.Automaton()
-    variant_map: dict[str, list[tuple[str, str, _VariantKind]]] = {}
+    variant_map: dict[str, list[tuple[str, str, _VariantKind, str | None, int]]] = {}
     seen: set[tuple[str, str]] = set()
+    and_rules: list[dict[str, Any]] = []
     for category, words in categories.items():
         for raw_word in words:
             word = raw_word.strip()
@@ -455,14 +466,32 @@ def _build_automaton(
                 _logger.warning("词库重复词条，已跳过：category=%s word=%s", category, word)
                 continue
             seen.add(key)
+            and_rule = _parse_and_rule(word)
+            if and_rule is not None:
+                rule_idx = len(and_rules)
+                and_rules.append(
+                    {
+                        "keyword": and_rule[0],
+                        "category": category,
+                        "terms": and_rule[1],
+                        "rule_index": rule_idx,
+                    }
+                )
+                # 每个 term 以 and_term 身份进自动机；term 自身也按变体展开
+                for term in and_rule[1]:
+                    for variant, _kind in _gen_variants_with_kind(term):
+                        variant_map.setdefault(variant, []).append(
+                            (word, category, "and_term", term, rule_idx)
+                        )
+                continue
             for variant, kind in _gen_variants_with_kind(word):
-                variant_map.setdefault(variant, []).append((word, category, kind))
+                variant_map.setdefault(variant, []).append((word, category, kind, None, -1))
     for variant, entries in variant_map.items():
         automaton.add_word(variant, (variant, entries))
     if not variant_map:
-        return None, 0
+        return None, 0, and_rules
     automaton.make_automaton()
-    return automaton, len(variant_map)
+    return automaton, len(variant_map), and_rules
 
 
 class KeywordEngine:
@@ -470,6 +499,7 @@ class KeywordEngine:
 
     def __init__(self) -> None:
         self._automaton: ahocorasick.Automaton | None = None
+        self._and_rules: list[dict[str, Any]] = []
         self._loaded = False
         # 正则消歧规则层（PRD v0.2 M4）：默认关闭（disambiguate 透传）
         self._regex = RegexRuleEngine()
@@ -497,11 +527,17 @@ class KeywordEngine:
             categories: 类别名 → 该类别关键词列表。
         """
 
-        automaton, variant_count = _build_automaton(categories)
+        automaton, variant_count, and_rules = _build_automaton(categories)
         with _RELOAD_LOCK:
             self._automaton = automaton
+            self._and_rules = and_rules
             self._loaded = True
-        _logger.info("关键词引擎加载完成：%d 类别 / %d 个变体", len(categories), variant_count)
+        _logger.info(
+            "关键词引擎加载完成：%d 类别 / %d 个变体 / %d 条组合规则",
+            len(categories),
+            variant_count,
+            len(and_rules),
+        )
 
     def reload(self, categories: dict[str, list[str]], rules: list[dict] | None = None) -> None:
         """重建词库自动机与正则规则层并原子替换（热重载入口，PRD v0.2 M4）。
@@ -526,9 +562,10 @@ class KeywordEngine:
         if rules is not None:
             new_regex = RegexRuleEngine()
             new_regex.load_from_rows(rules)
-        automaton, variant_count = _build_automaton(categories)
+        automaton, variant_count, and_rules = _build_automaton(categories)
         with _RELOAD_LOCK:
             self._automaton = automaton
+            self._and_rules = and_rules
             self._loaded = True
             if new_regex is not None:
                 self._regex = new_regex
@@ -538,9 +575,10 @@ class KeywordEngine:
                 self._regex = RegexRuleEngine()
                 self._rules_enabled = False
         _logger.info(
-            "关键词引擎热重载完成：%d 类别 / %d 个变体 / 规则层=%s",
+            "关键词引擎热重载完成：%d 类别 / %d 个变体 / %d 条组合规则 / 规则层=%s",
             len(categories),
             variant_count,
+            len(and_rules),
             "启用" if rules is not None else "关闭",
         )
 
@@ -586,19 +624,29 @@ class KeywordEngine:
             return []
         hits: list[KeywordHitData] = []
         automaton = self._automaton
+        and_hits: dict[int, dict[str, list[KeywordHitData]]] = {}
         # 原文直扫：变体以原样出现，命中位置即原文位置
         for end_idx, (variant, entries) in automaton.iter(text):
             start = end_idx - len(variant) + 1
             end = end_idx + 1
-            for word, category, kind in entries:
+            for word, category, kind, and_term, rule_idx in entries:
+                if kind == "and_term":
+                    and_hits.setdefault(rule_idx, {}).setdefault(and_term, []).append(
+                        KeywordHitData(word, category, text[start:end], start, end, "literal")
+                    )
+                    continue
                 hits.append(KeywordHitData(word, category, text[start:end], start, end, kind))
         # 拼音展开扫描：正文汉字段→拼音串（带分隔符）后扫描，命中回映射原文汉字段
         search_text, posmap = _build_pinyin_index(text)
         if search_text != text:
             for end_idx, (variant, entries) in automaton.iter(search_text):
                 start = end_idx - len(variant) + 1
-                for word, category, kind in entries:
-                    if kind not in ("pinyin_full", "pinyin_init", "pinyin_fuzzy"):
+                for word, category, kind, and_term, rule_idx in entries:
+                    if kind not in ("pinyin_full", "pinyin_init", "pinyin_fuzzy", "and_term"):
+                        continue
+                    if kind == "and_term":
+                        # 组合 term 的拼音变体同样可参与；按 term 原文走弱信号
+                        and_hits.setdefault(rule_idx, {}).setdefault(and_term, [])
                         continue
                     if _han_count(word) < _MIN_PINYIN_HAN_LEN:
                         continue
@@ -616,6 +664,28 @@ class KeywordEngine:
                             word, category, text[orig_start:orig_end], orig_start, orig_end, kind
                         )
                     )
+        # 组合规则：全部 term 均有命中才生成一条命中（匹配片段 = 组合词原文）
+        for rule in self._and_rules:
+            rule_idx = int(rule["rule_index"])
+            term_hits = and_hits.get(rule_idx)
+            if term_hits is None:
+                continue
+            if len(term_hits) < len(rule["terms"]):
+                continue
+            if any(not term_hits.get(term) for term in rule["terms"]):
+                continue
+            first_start = min(h.start for hs in term_hits.values() for h in hs)
+            last_end = max(h.end for hs in term_hits.values() for h in hs)
+            hits.append(
+                KeywordHitData(
+                    keyword=rule["keyword"],
+                    category=rule["category"],
+                    matched=text[first_start:last_end],
+                    start=first_start,
+                    end=last_end,
+                    kind="literal",
+                )
+            )
         # 去重（同一 (category, keyword, start, end) 保留一条），按 start 排序
         unique: dict[tuple[str, str, int, int], KeywordHitData] = {}
         for hit in hits:

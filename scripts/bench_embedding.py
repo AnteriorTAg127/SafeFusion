@@ -44,9 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Embedding 服务吞吐调优：batch × workers 网格测试。",
     )
     parser.add_argument("--url", default=_DEFAULT_URL, help=f"服务 base_url（默认 {_DEFAULT_URL}）")
-    parser.add_argument(
-        "--model", default=_DEFAULT_MODEL, help=f"模型名（默认 {_DEFAULT_MODEL}）"
-    )
+    parser.add_argument("--model", default=_DEFAULT_MODEL, help=f"模型名（默认 {_DEFAULT_MODEL}）")
     parser.add_argument(
         "--batches",
         default=",".join(str(b) for b in _DEFAULT_BATCHES),

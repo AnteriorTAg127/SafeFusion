@@ -151,6 +151,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="cloud 后端允许无 API Key（本地无鉴权服务如 llama.cpp --embeddings）",
     )
     parser.add_argument(
+        "--image-protocol",
+        choices=("openai", "llamacpp"),
+        default="openai",
+        help=(
+            "cloud 后端图片编码协议：openai（默认，/v1/embeddings+input+data URI）"
+            "| llamacpp（llama.cpp 多模态专用 /embeddings+content+multimodal_data，"
+            "需配合 --base-url 指向 llama.cpp 服务）"
+        ),
+    )
+    parser.add_argument(
+        "--image-max-side",
+        type=int,
+        default=1024,
+        help="cloud 图片编码前最长边缩放上限（px，默认 1024；0 不缩放）",
+    )
+    parser.add_argument(
+        "--image-quality",
+        type=int,
+        default=85,
+        help="cloud 图片 JPEG 压缩质量（1~95，默认 85）",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -258,6 +280,9 @@ def build_backend(args: argparse.Namespace) -> BaseEmbedding:
             "model": args.cloud_model or args.model or _DEFAULT_MODEL,
             "timeout": args.cloud_timeout,
             "allow_no_key": bool(args.no_api_key),
+            "image_protocol": args.image_protocol,
+            "image_max_side": args.image_max_side,
+            "image_quality": args.image_quality,
         }
         return get_embedding_backend({"backend": "cloud", "cloud": cloud_cfg})
     local_cfg: dict[str, Any] = {"device": args.device}
@@ -543,8 +568,7 @@ def main(argv: list[str] | None = None) -> int:
     dim: int | None = None
     start = time.perf_counter()
     batches = [
-        pending[start_idx : start_idx + batch_size]
-        for start_idx in range(0, total, batch_size)
+        pending[start_idx : start_idx + batch_size] for start_idx in range(0, total, batch_size)
     ]
     _add_lock = threading.Lock()
 

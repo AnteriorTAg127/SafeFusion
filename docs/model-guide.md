@@ -57,7 +57,33 @@ light_model:
 
 保存即热应用生效；可在设置页点「🔌 测试连接」（channel=fasttext）验证模型文件存在 + 可加载。
 
-## 4. 常见模型故障排查表
+## 4. 多 Provider / 远程 ReRanker（v0.4.0）
+
+Embedding、LLM、Rerank 三类均支持多提供者，按 `priority`（数字小优先）自动切换；`active_provider` 可手动指定首选；失败自动熔断（配置见[配置体系](config-guide.md#3-多-provider-与失败切换v040)）。
+
+- **Embedding**：每个 provider 可指定 `vector_store`，实现“不同模型映射到不同/同一向量库”；多向量库按需懒加载，不会启动即常驻；
+- **LLM**：每个 provider 为独立 OpenAI 兼容端点；某个返回 None / 抛异常时自动尝试下一个；
+- **Rerank**：
+  - `type: local` 复用当前 Embedding 做本地 CLIP 二次编码（零新模型）；
+  - `type: cloud` 调用远程 `POST {base_url}/rerank`（OpenAI/自定义 JSON 兼容，响应支持 `results` / `data` 两种）；
+  - 总开关 `semantic.rerank_enabled`；providers 为空时回退本地 CLIP；
+  - 设置页「Rerank 多提供者」分组可编辑，`测试连接` channel=rerank 可远程冒烟。
+
+### 4.1 多 Provider 状态摘要
+
+`GET /admin/models` 与 `GET /admin/health` 新增 `providers` 字段：
+
+```json
+{
+  "providers": {
+    "embedding": { "configured": true, "active_provider": "local-clip", "providers": [{"name": "local-clip", "priority": 1}] },
+    "llm": { "configured": true, "active_provider": null, "providers": [{"name": "openai", "priority": 1}] },
+    "rerank": { "configured": true, "active_provider": null, "providers": [{"name": "cloud-jina", "type": "cloud", "priority": 2}] }
+  }
+}
+```
+
+## 5. 常见模型故障排查表
 
 | 症状 | 排查 / 解决 |
 |---|---|

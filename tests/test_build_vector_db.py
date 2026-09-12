@@ -271,6 +271,39 @@ class TestHelpers:
         assert items[0].metadata["category"] == "色情"
         assert items[0].metadata["source"] == "s1"
 
+    def test_build_backend_cloud_passes_image_protocol(
+        self, mod: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _fake_get(cfg: dict[str, Any], **kwargs: Any) -> Any:
+            captured["cfg"] = cfg
+            return object()
+
+        monkeypatch.setattr(mod, "get_embedding_backend", _fake_get)
+        args = mod.parse_args(
+            [
+                "--backend",
+                "cloud",
+                "--base-url",
+                "http://127.0.0.1:5546/v1",
+                "--cloud-model",
+                "WeMM-Embedding-2B-Q4_K_M.gguf",
+                "--no-api-key",
+                "--image-protocol",
+                "llamacpp",
+                "--image-max-side",
+                "512",
+                "--image-quality",
+                "70",
+            ]
+        )
+        mod.build_backend(args)
+        cloud = captured["cfg"]["cloud"]
+        assert cloud["image_protocol"] == "llamacpp"
+        assert cloud["image_max_side"] == 512
+        assert cloud["image_quality"] == 70
+
     def test_encode_texts_safely_batch_fail_then_retry(self, mod: Any) -> None:
         class _FailBatch:
             def __init__(self) -> None:
