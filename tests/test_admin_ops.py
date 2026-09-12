@@ -99,10 +99,14 @@ def admin_client(tmp_path: Path) -> TestClient:
 
 
 def _seed_store(ctx: AppContext, pool: str, rows: int = 3, dim: int = 4) -> None:
-    """向容器向量库注入 (category, text) 条目（真实 NumpyVectorStore）。"""
+    """向容器向量库注入 (category, text) 条目（真实 NumpyVectorStore）。
 
-    assert ctx.store is not None
-    ctx.store.add(
+    多向量库懒加载后，先确保当前 store 已加载再注入。
+    """
+
+    store = ctx.ensure_current_store()
+    assert store is not None
+    store.add(
         [
             VectorItem(
                 id=f"{pool}-{i}",
@@ -113,7 +117,7 @@ def _seed_store(ctx: AppContext, pool: str, rows: int = 3, dim: int = 4) -> None
             for i in range(rows)
         ]
     )
-    ctx.store.save()
+    store.save()
 
 
 # ------------------------------------------------------------------ 懒加载
@@ -291,6 +295,39 @@ class TestModelsEndpoint:
         clip = client.get("/admin/models", headers=_headers()).json()["chinese_clip"]
         assert clip["backend"] == "cloud"
         assert clip["status"] == "cloud"
+        client.close()
+        db.close()
+
+    def test_providers_summary_included(self, tmp_path: Path) -> None:
+        db, ctx = _build_context(
+            tmp_path,
+            embedding={
+                "providers": [
+                    {"name": "a", "backend": "local", "priority": 1, "vector_store": "default"}
+                ],
+                "active_provider": "a",
+            },
+            llm={"providers": [{"name": "b", "base_url": "http://b", "model": "m", "priority": 2}]},
+            rerank={
+                "providers": [
+                    {
+                        "name": "c",
+                        "type": "cloud",
+                        "base_url": "http://c",
+                        "model": "rm",
+                        "priority": 1,
+                    }
+                ]
+            },
+        )
+        client = _make_app(tmp_path, container=ctx, db=db)
+        body = client.get("/admin/models", headers=_headers()).json()
+        providers = body["providers"]
+        assert providers["embedding"]["configured"] is True
+        assert providers["embedding"]["active_provider"] == "a"
+        assert providers["embedding"]["providers"][0]["name"] == "a"
+        assert providers["llm"]["providers"][0]["model"] == "m"
+        assert providers["rerank"]["providers"][0]["type"] == "cloud"
         client.close()
         db.close()
 
@@ -489,6 +526,11 @@ class TestAdminHealth:
         assert body["components"]["semantic"]["reason"] == "lazy_pending"
         assert body["components"]["vector_black"]["count"] == 4
         assert body["components"]["vector_black"]["dim"] == 6
+        # 多提供者摘要（PRD v0.4.0 M4）
+        assert set(body["providers"]) == {"embedding", "llm", "rerank"}
+        assert body["providers"]["embedding"]["configured"] is False
+        assert body["providers"]["llm"]["providers"] == []
+        assert body["providers"]["rerank"]["active_provider"] is None
         # 数据概况
         assert body["data"] == {
             "keywords": 1,
@@ -615,6 +657,41 @@ class TestTestConnection:
         assert body["ok"] is False
         assert "未配置" in body["message"]
 
+    def test_rerank_no_provider_returns_readable_failure(self, admin_client: TestClient) -> None:
+        body = admin_client.post(
+            "/admin/config/test-connection", json={"channel": "rerank"}, headers=_headers()
+        ).json()
+        assert body["ok"] is False
+        assert "未配置 rerank.providers" in body["message"]
+
+    def test_rerank_local_provider_returns_ok_without_network(
+        self, admin_client: TestClient
+    ) -> None:
+        body = admin_client.post(
+            "/admin/config/test-connection",
+            json={
+                "channel": "rerank",
+                "config": {"providers": [{"name": "local", "type": "local", "priority": 1}]},
+            },
+            headers=_headers(),
+        ).json()
+        assert body["ok"] is True
+        assert "本地 Rerank" in body["message"]
+
+    def test_rerank_cloud_missing_required_returns_readable_failure(
+        self, admin_client: TestClient
+    ) -> None:
+        body = admin_client.post(
+            "/admin/config/test-connection",
+            json={
+                "channel": "rerank",
+                "config": {"providers": [{"name": "bad", "type": "cloud"}]},
+            },
+            headers=_headers(),
+        ).json()
+        assert body["ok"] is False
+        assert "base_url" in body["message"] or "model" in body["message"]
+
     def test_secret_payload_ignored(self, admin_client: TestClient) -> None:
         # 临时参数携带 api_key（红线）：被剥离，不参与合并，不返回密钥值
         body = admin_client.post(
@@ -719,3 +796,139 @@ class TestChangePassword:
         )
         client2.close()
         db.close()
+
+
+class _SpyReloadCtx:
+    """只提供 ``reload_keywords`` 的容器替身：记录调用次数与返回值。"""
+
+    def __init__(self, result: bool = True, raises: bool = False) -> None:
+        self.calls = 0
+        self._result = result
+        self._raises = raises
+
+    def reload_keywords(self) -> bool:
+        self.calls += 1
+        if self._raises:
+            raise RuntimeError("模拟热重载失败")
+        return self._result
+
+
+class TestKeywordWriteTriggersReload:
+    """回归（v0.5.0 缺陷 1）：词库 import / delete 必须触发热重载。
+
+    此前两个端点只写库、不调用任何重载钩子（仅 dedup 调了），导致新违禁词在进程
+    重启前完全不参与审核，而后台仍回显「导入成功」——运维据此获得虚假成功反馈。
+    """
+
+    def test_import_triggers_reload_and_new_word_is_live(self, tmp_path: Path) -> None:
+        """导入后【不重启、不手工 reload】即应命中新词。"""
+
+        db, ctx = _build_context(tmp_path)
+        client = _make_app(tmp_path, container=ctx, db=db)
+        try:
+            assert ctx.keyword_engine.scan("他在搞洗钱活动") == []  # 导入前不命中
+            resp = client.post(
+                "/admin/keywords/import",
+                files={"file": ("kw.csv", "类别,词\n违禁,洗钱\n", "text/csv")},
+                headers=_headers(),
+            )
+            body = resp.json()
+            assert resp.status_code == 200
+            assert body["inserted"] == 1
+            assert body["reload"] == "ok"
+            hits = ctx.keyword_engine.scan("他在搞洗钱活动")
+            assert [hit.keyword for hit in hits] == ["洗钱"]
+        finally:
+            client.close()
+            db.close()
+
+    def test_delete_triggers_reload_and_word_stops_hitting(self, tmp_path: Path) -> None:
+        """删除后【不重启】即应停止命中。"""
+
+        db, ctx = _build_context(tmp_path)
+        client = _make_app(tmp_path, container=ctx, db=db)
+        try:
+            client.post(
+                "/admin/keywords/import",
+                files={"file": ("kw.csv", "类别,词\n违禁,洗钱\n", "text/csv")},
+                headers=_headers(),
+            )
+            assert len(ctx.keyword_engine.scan("他在搞洗钱活动")) == 1
+            keyword_id = db.list_keywords()[0]["id"]
+            resp = client.delete(f"/admin/keywords/{keyword_id}", headers=_headers())
+            assert resp.status_code == 200
+            assert resp.json() == {"deleted": keyword_id, "reload": "ok"}
+            assert ctx.keyword_engine.scan("他在搞洗钱活动") == []
+        finally:
+            client.close()
+            db.close()
+
+    def test_reload_called_exactly_once_per_write(self, tmp_path: Path) -> None:
+        """接线断言：每次写入恰好触发一次 reload_keywords。"""
+
+        db = Database(tmp_path / "audit.db")
+        spy = _SpyReloadCtx()
+        client = _make_app(tmp_path, container=spy, db=db)
+        try:
+            client.post(
+                "/admin/keywords/import",
+                files={"file": ("kw.csv", "类别,词\n违禁,洗钱\n", "text/csv")},
+                headers=_headers(),
+            )
+            assert spy.calls == 1
+            keyword_id = db.list_keywords()[0]["id"]
+            client.delete(f"/admin/keywords/{keyword_id}", headers=_headers())
+            assert spy.calls == 2
+        finally:
+            client.close()
+            db.close()
+
+    def test_reload_returning_false_reports_failed(self, tmp_path: Path) -> None:
+        """重载失败归类 failed，但已落库的写入不回滚。"""
+
+        db = Database(tmp_path / "audit.db")
+        client = _make_app(tmp_path, container=_SpyReloadCtx(result=False), db=db)
+        try:
+            resp = client.post(
+                "/admin/keywords/import",
+                files={"file": ("kw.csv", "类别,词\n违禁,洗钱\n", "text/csv")},
+                headers=_headers(),
+            )
+            assert resp.json()["reload"] == "failed"
+            assert resp.json()["inserted"] == 1
+            assert len(db.list_keywords()) == 1  # 写入保留
+        finally:
+            client.close()
+            db.close()
+
+    def test_reload_raising_is_swallowed_as_failed(self, tmp_path: Path) -> None:
+        """重载抛异常不得让端点 500（不因刷新失败回绝已落库的写操作）。"""
+
+        db = Database(tmp_path / "audit.db")
+        client = _make_app(tmp_path, container=_SpyReloadCtx(raises=True), db=db)
+        try:
+            resp = client.post(
+                "/admin/keywords/import",
+                files={"file": ("kw.csv", "类别,词\n违禁,洗钱\n", "text/csv")},
+                headers=_headers(),
+            )
+            assert resp.status_code == 200
+            assert resp.json()["reload"] == "failed"
+            assert len(db.list_keywords()) == 1
+        finally:
+            client.close()
+            db.close()
+
+    def test_dedup_still_reports_reload(self, tmp_path: Path) -> None:
+        """收拢到同一助手后，dedup 的 reload 契约不变。"""
+
+        db, ctx = _build_context(tmp_path)
+        client = _make_app(tmp_path, container=ctx, db=db)
+        try:
+            db.add_keywords([("测试", "敏感词", "s1")])
+            resp = client.post("/admin/keywords/dedup", headers=_headers())
+            assert resp.status_code == 200
+            assert resp.json()["reload"] == "ok"
+        finally:
+            client.close()
+            db.close()

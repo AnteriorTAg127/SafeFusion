@@ -168,7 +168,8 @@ class TestKeywordsEndpoints:
             headers=_headers(),
         )
         assert resp.status_code == 200
-        assert resp.json() == {"inserted": 2, "skipped": 0, "total": 2}
+        # reload=skipped：本夹具未注入 container（热重载接线见 test_admin_ops 回归用例）
+        assert resp.json() == {"inserted": 2, "skipped": 0, "total": 2, "reload": "skipped"}
         assert len(db.list_keywords()) == 2
 
     def test_import_csv_duplicate_skipped(self, admin_env) -> None:
@@ -176,7 +177,7 @@ class TestKeywordsEndpoints:
         payload = {"file": ("w.csv", "类别,词\n色情,裸聊\n广告,加我", "text/csv")}
         client.post("/admin/keywords/import", files=payload, headers=_headers())
         resp = client.post("/admin/keywords/import", files=payload, headers=_headers())
-        assert resp.json() == {"inserted": 0, "skipped": 2, "total": 2}
+        assert resp.json() == {"inserted": 0, "skipped": 2, "total": 2, "reload": "skipped"}
 
     def test_import_txt_requires_category(self, admin_env) -> None:
         _, client = admin_env
@@ -194,8 +195,75 @@ class TestKeywordsEndpoints:
             files={"file": ("words.txt", "# 注释\n裸聊\n\n加我", "text/plain")},
             headers=_headers(),
         )
-        assert resp.json() == {"inserted": 2, "skipped": 0, "total": 2}
+        assert resp.json() == {"inserted": 2, "skipped": 0, "total": 2, "reload": "skipped"}
         assert all(r["category"] == "色情" for r in db.list_keywords())
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "类别,词",
+            "类别,关键词",
+            "category,word",
+            "Category,Word",
+            "CATEGORY,KEYWORD",
+            "cat,word",
+            " category , word ",
+        ],
+    )
+    def test_import_csv_header_aliases_skipped(self, admin_env, header: str) -> None:
+        """回归（v0.5.0 缺陷 2）：中英文 / 大小写表头均须跳过，不得写进词库。
+
+        此前只认字面量 ``类别,词``，英文表头会被当作词条入库（脏数据
+        ``('category','word')`` 参与 AC 构建，且 ``word`` 会命中任何含该英文
+        单词的文本造成误判）。
+        """
+
+        db, client = admin_env
+        resp = client.post(
+            "/admin/keywords/import",
+            files={"file": ("kw.csv", f"{header}\n违禁,赌博\n违禁,诈骗\n", "text/csv")},
+            headers=_headers(),
+        )
+        assert resp.json()["inserted"] == 2
+        words = [row["word"] for row in db.list_keywords()]
+        assert words == ["赌博", "诈骗"]
+        assert "word" not in words and "keyword" not in words
+
+    def test_import_csv_first_row_data_not_treated_as_header(self, admin_env) -> None:
+        """首行是合法词条时不得被误判为表头。"""
+
+        db, client = admin_env
+        resp = client.post(
+            "/admin/keywords/import",
+            files={"file": ("kw.csv", "违禁,洗钱\n违禁,赌博\n", "text/csv")},
+            headers=_headers(),
+        )
+        assert resp.json()["inserted"] == 2
+        assert [row["word"] for row in db.list_keywords()] == ["洗钱", "赌博"]
+
+    def test_import_csv_header_after_blank_lines_still_skipped(self, admin_env) -> None:
+        """表头前有空行时仍能识别（空行不消耗首行判定）。"""
+
+        db, client = admin_env
+        resp = client.post(
+            "/admin/keywords/import",
+            files={"file": ("kw.csv", "\n  \ncategory,word\n违禁,洗钱\n", "text/csv")},
+            headers=_headers(),
+        )
+        assert resp.json()["inserted"] == 1
+        assert [row["word"] for row in db.list_keywords()] == ["洗钱"]
+
+    def test_import_csv_header_like_row_after_first_kept_as_word(self, admin_env) -> None:
+        """仅首行参与表头判定：后文同形行按词条处理（不静默丢弃）。"""
+
+        db, client = admin_env
+        resp = client.post(
+            "/admin/keywords/import",
+            files={"file": ("kw.csv", "违禁,洗钱\ncategory,word\n", "text/csv")},
+            headers=_headers(),
+        )
+        assert resp.json()["inserted"] == 2
+        assert {row["word"] for row in db.list_keywords()} == {"洗钱", "word"}
 
     def test_list_keywords_paginated(self, admin_env) -> None:
         db, client = admin_env

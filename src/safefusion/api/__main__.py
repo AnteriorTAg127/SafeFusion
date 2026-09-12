@@ -17,6 +17,10 @@
 API Key 一律不写入日志明文，自动生成的管理令牌按 T11 逻辑仅此一次打印。
 
 v0.3.0（M4 配置 DB 化）变更：
+- **配置文件入口（v0.5.0 修复）**：``--config <path>`` 命令行参数优先，其次
+  ``SAFEFUSION_CONFIG`` 环境变量；两者皆缺时用内置默认值 + 环境变量。此前入口
+  硬编码 ``load_config(None)``，导致 README / docs 引导用户创建的 ``config.yaml``
+  **从未被加载**（静默失效）；
 - **启动迁移**：``load_config`` 之后先打开 ``{data_dir}/audit.db`` 并执行
   ``migrate_overrides_file``——检测到旧 ``data/config_overrides.json`` 时
   一次性导入 settings 表并归档为 ``.migrated``（失败仅告警、不阻止启动）；
@@ -32,6 +36,7 @@ v0.3.0（M4 配置 DB 化）变更：
 
 from __future__ import annotations
 
+import argparse
 import os
 import threading
 from pathlib import Path
@@ -65,13 +70,43 @@ def _find_web_dist() -> Path | None:
     return None
 
 
+class _SPAFallbackStaticFiles(StaticFiles):
+    """带 SPA history 路由回退的静态文件托管。
+
+    Vue Router 使用 history 模式，直接访问 /trial、/audit 等前端路由时
+    ``StaticFiles(html=True)`` 本身不会回退到 ``index.html``，会 404。
+    本类在文件不存在且路径不是 API 路径时返回 ``index.html``，使前端路由
+    可直接访问 / 刷新（PRD v0.4.0 M5 前端体验修复）。
+    """
+
+    def __init__(self, directory: str | Path | None = None) -> None:
+        super().__init__(directory=directory, html=True)
+        self._root = Path(directory or "")
+
+    async def get_response(self, path: str, scope: Any) -> Any:
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404 and not path.startswith("admin/"):
+                index = self._root / "index.html"
+                if index.is_file():
+                    from fastapi.responses import FileResponse
+
+                    return FileResponse(str(index))
+            raise
+
+
 def maybe_mount_web_dist(app: Any, dist_dir: str | Path | None = None) -> bool:
     """``web/dist/index.html`` 存在时把 ``/`` 挂载为静态托管（html=True）。
 
     - 不存在时保持现状（不 mount，不影响既有行为与测试 / 部署，PRD 风险表）；
     - **挂载顺序**：须在所有路由注册（``include_router``）之后调用——Starlette
       按注册顺序匹配路由，``/admin/*`` 优先命中 API 路由，不会被 ``/`` 静态
-      目录吞掉；dist 存在时 FastAPI 默认 ``/docs`` 等文档路由让位于前端。
+      目录吞掉；dist 存在时 FastAPI 默认 ``/docs`` 等文档路由让位于前端；
+    - **SPA fallback**：使用 :class:`_SPAFallbackStaticFiles`，对前端 history
+      路由（/trial、/audit 等）回退到 ``index.html``，避免直接访问 404。
 
     Args:
         app: 待挂载的 FastAPI 应用（管理 API）。
@@ -84,14 +119,50 @@ def maybe_mount_web_dist(app: Any, dist_dir: str | Path | None = None) -> bool:
     target = Path(dist_dir) if dist_dir is not None else _find_web_dist()
     if target is None or not (target / "index.html").is_file():
         return False
-    app.mount("/", StaticFiles(directory=str(target), html=True), name="web")
+    app.mount("/", _SPAFallbackStaticFiles(directory=str(target)), name="web")
     return True
 
 
-def main() -> None:
-    """双服务启动：审核 API（``server.port``）+ 管理 API（``server.admin_port``，守护线程）。"""
+def _resolve_config_path(argv: list[str] | None = None) -> str | None:
+    """解析 YAML 配置文件路径：``--config`` 参数优先，其次 ``SAFEFUSION_CONFIG`` 环境变量。
 
-    base_config = load_config(None)
+    用 ``parse_known_args``（而非 ``parse_args``）以兼容 uvicorn 等透传的未知参数，
+    避免启动因多余参数直接失败。
+
+    Args:
+        argv: 参数列表（不含程序名）；None 时取 ``sys.argv[1:]``。
+
+    Returns:
+        YAML 路径字符串；两者均未提供时返回 None（仅用内置默认值 + 环境变量）。
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="python -m safefusion.api",
+        description="SafeFusion 双服务入口（审核 API + 管理 API）",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="YAML 配置文件路径（缺省读 SAFEFUSION_CONFIG 环境变量，再缺省用内置默认值）",
+    )
+    args, _ = parser.parse_known_args(argv)
+    return args.config_path or os.environ.get("SAFEFUSION_CONFIG") or None
+
+
+def main(argv: list[str] | None = None) -> None:
+    """双服务启动：审核 API（``server.port``）+ 管理 API（``server.admin_port``，守护线程）。
+
+    Args:
+        argv: 命令行参数（不含程序名）；None 时取 ``sys.argv[1:]``。支持
+            ``--config <path>`` 指定 YAML 配置（亦可由 ``SAFEFUSION_CONFIG`` 提供）。
+    """
+
+    config_path = _resolve_config_path(argv)
+    base_config = load_config(config_path)
+    if config_path is not None:
+        # 仅打印路径（不含内容），配置内容可能含敏感项；密钥类一律不走 YAML。
+        logger.info("已加载配置文件：%s", config_path)
     setup_logging(base_config)
 
     # v0.3.0 M4：启动一次性迁移（旧覆盖层 → settings 表），失败仅告警不阻止启动

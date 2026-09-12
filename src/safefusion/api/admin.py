@@ -58,6 +58,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import numpy as np
 from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -70,6 +71,7 @@ from safefusion.config import AppConfig, load_config
 from safefusion.core import hot_apply
 from safefusion.core.config_override import (
     candidate_overrides,
+    config_schema,
     config_sources,
     effective_config,
     flatten_group,
@@ -84,6 +86,7 @@ from safefusion.core.orchestrator import AuditOrchestrator
 from safefusion.core.review import ReviewScheduler
 from safefusion.engines.embedding import get_embedding_backend
 from safefusion.engines.image_pipeline import WhitelistMatcher, compute_hashes, decode_images
+from safefusion.engines.keyword_preprocess import preprocess_keyword_items
 from safefusion.engines.light_model import LightTextModel
 from safefusion.engines.llm_client import LLMClient
 from safefusion.engines.model_repo import (
@@ -92,6 +95,7 @@ from safefusion.engines.model_repo import (
     probe_hf_model,
     resolve_hf_cache_dir,
 )
+from safefusion.engines.rerank import CloudRerank
 from safefusion.logging_setup import get_logger
 from safefusion.models.schemas import AuditRequest, ImageInput
 from safefusion.storage.database import Database
@@ -172,7 +176,7 @@ class ModelDownloadBody(BaseModel):
 class TestConnectionBody(BaseModel):
     """POST /admin/config/test-connection 请求体（各渠道冒烟，临时参数不落库）。"""
 
-    channel: Literal["embedding", "llm", "fasttext"] = Field(description="待测试渠道")
+    channel: Literal["embedding", "llm", "rerank", "fasttext"] = Field(description="待测试渠道")
     config: dict[str, Any] | None = Field(
         default=None,
         description=(
@@ -434,6 +438,84 @@ async def _test_llm_channel(ctx: AppContext, override: dict[str, Any] | None) ->
         return _channel_result("llm", False, f"连接失败：{_err_text(exc)}")
 
 
+async def _test_rerank_channel(ctx: AppContext, override: dict[str, Any] | None) -> dict[str, Any]:
+    """rerank 渠道冒烟（PRD v0.4.0 M4）：对远程 ReRanker 发最小重排请求。
+
+    - 优先取 ``rerank.providers`` 中 active/最低优先级的 cloud provider；
+    - 支持 ``override`` 传入临时 provider（仅本次冒烟，不落库）；
+    - local provider 不做网络冒烟，返回「本地 CLIP 二次编码无需远程验证，
+      实际效果经试运行/审核观察」。
+    """
+    cfg = ctx.config
+    merged = _deep_merge_dict(
+        cfg.rerank.model_dump(), _strip_secret_keys_from_payload(override or {})
+    )
+    providers = merged.get("providers") or []
+    if not providers:
+        return _channel_result(
+            "rerank",
+            False,
+            "未配置 rerank.providers（需先添加远程 ReRanker 提供者；开关 semantic.rerank_enabled）",
+        )
+    active = merged.get("active_provider")
+    provider = None
+    if active:
+        provider = next((p for p in providers if p.get("name") == active), None)
+    if provider is None:
+        provider = min(providers, key=lambda p: int(p.get("priority", 1)))
+    if str(provider.get("type") or "local").lower() != "cloud":
+        return _channel_result(
+            "rerank",
+            True,
+            "本地 Rerank 提供者无需远程冒烟（由本地 CLIP 二次编码执行）；"
+            "可到试运行/审核记录观察实际重排效果",
+            {"provider": provider.get("name"), "type": "local"},
+        )
+    try:
+        backend = CloudRerank(provider)
+    except Exception as exc:
+        return _channel_result("rerank", False, f"Rerank 配置不可用：{_err_text(exc)}")
+    try:
+        t0 = time.monotonic()
+        # 最小冒烟：两个候选文档，一条正常一条应被远程重排
+        out = await run_in_threadpool(
+            backend.rerank,
+            np.zeros(2),
+            [
+                {
+                    "id": "a",
+                    "score": 0.5,
+                    "metadata": {"text": "正常内容", "_query_text": "连接测试"},
+                },
+                {
+                    "id": "b",
+                    "score": 0.1,
+                    "metadata": {"text": "违规测试", "_query_text": "连接测试"},
+                },
+            ],
+        )
+        cost_ms = round((time.monotonic() - t0) * 1000, 1)
+        scores = [round(float(item.get("rerank_score", 0.0)), 4) for item in out]
+        return _channel_result(
+            "rerank",
+            True,
+            "远程 ReRanker 冒烟成功",
+            {
+                "duration_ms": cost_ms,
+                "provider": provider.get("name"),
+                "model": provider.get("model"),
+                "scores": scores,
+            },
+        )
+    except Exception as exc:
+        return _channel_result("rerank", False, f"连接失败：{_err_text(exc)}")
+    finally:
+        closer = getattr(backend, "close", None)
+        if callable(closer):
+            with contextlib.suppress(Exception):
+                closer()
+
+
 def _test_fasttext_channel(ctx: AppContext, override: dict[str, Any] | None) -> dict[str, Any]:
     """fasttext 渠道冒烟：文件存在 + LightTextModel 可加载（构造即冒烟，绝不抛）。"""
 
@@ -479,6 +561,34 @@ def _test_fasttext_channel(ctx: AppContext, override: dict[str, Any] | None) -> 
         )
     except Exception as exc:
         return _channel_result("fasttext", False, f"加载失败：{_err_text(exc)}")
+
+
+def _provider_summary(cfg: Any) -> dict[str, Any]:
+    """汇总 Embedding / LLM / Rerank 多提供者摘要（PRD v0.4.0 M4）。
+
+    返回：``{group: {configured, active_provider, providers: [{name, priority, ...}]}}``；
+    无多提供者时 providers 为空列表、active_provider 为 None（前端据此显示单后端兼容）。
+    """
+
+    def _summarize(group_cfg: Any, type_keys: tuple[str, ...]) -> dict[str, Any]:
+        providers = []
+        for p in group_cfg.providers:
+            item = {"name": p.name, "priority": p.priority}
+            for key in type_keys:
+                if getattr(p, key, None) is not None:
+                    item[key] = getattr(p, key)
+            providers.append(item)
+        return {
+            "configured": bool(providers),
+            "active_provider": group_cfg.active_provider,
+            "providers": providers,
+        }
+
+    return {
+        "embedding": _summarize(cfg.embedding, ("backend", "vector_store")),
+        "llm": _summarize(cfg.llm, ("base_url", "model")),
+        "rerank": _summarize(cfg.rerank, ("type", "base_url", "model")),
+    }
 
 
 def _resolve_admin_token(config: Any, db: Any = None) -> str:
@@ -583,8 +693,31 @@ def _backup_keywords_zip(data_dir: Path, db: Any) -> str:
     return filename
 
 
+def _match_csv_header(pair: tuple[str, str], headers: tuple[tuple[str, str], ...]) -> bool:
+    """判断 CSV 首行两列是否为表头（别名表命中，大小写不敏感、忽略首尾空白）。"""
+
+    return (pair[0].strip().lower(), pair[1].strip().lower()) in headers
+
+
+#: 词库 CSV 表头别名（仅首行判定）：中英文常见写法
+_KEYWORDS_CSV_HEADERS: tuple[tuple[str, str], ...] = (
+    ("类别", "词"),
+    ("类别", "关键词"),
+    ("类别", "word"),
+    ("category", "word"),
+    ("category", "keyword"),
+    ("cat", "word"),
+)
+
+
 def _parse_keywords_csv(text: str) -> list[tuple[str, str, str]]:
-    """解析 CSV（类别,词 两列）：跳过空行与表头行，返回 (category, word, source) 三元组。"""
+    """解析 CSV（类别,词 两列）：跳过空行与**首行表头**，返回 (category, word, source)。
+
+    表头识别支持中英文别名（``类别/词``、``category/word`` 等，大小写不敏感），
+    与 :func:`_parse_rules_csv` 采用同一判定机制；仅首行参与表头判定，避免误跳过
+    后文的合法词条。此前仅认中文字面量 ``类别,词``，英文表头会被当作词条写入
+    词库（v0.5.0 缺陷 2 修复）。
+    """
 
     items: list[tuple[str, str, str]] = []
     head = True
@@ -594,10 +727,10 @@ def _parse_keywords_csv(text: str) -> list[tuple[str, str, str]]:
         category, word = row[0].strip(), row[1].strip()
         if not category or not word:
             continue
-        if head and category == "类别" and word == "词":
+        if head:
             head = False
-            continue
-        head = False
+            if _match_csv_header((category, word), _KEYWORDS_CSV_HEADERS):
+                continue
         items.append((category, word, "admin_import"))
     return items
 
@@ -614,7 +747,7 @@ def _parse_keywords_txt(text: str, category: str) -> list[tuple[str, str, str]]:
     return items
 
 
-#: 规则 CSV 表头行（中英文均可，逐行判定跳过）
+#: 规则 CSV 表头行（中英文均可，大小写不敏感；仅首行判定）
 _RULES_CSV_HEADERS: tuple[tuple[str, str], ...] = (
     ("category", "pattern"),
     ("类别", "规则"),
@@ -643,7 +776,7 @@ def _parse_rules_csv(text: str) -> list[dict[str, Any]]:
         category, pattern = row[0].strip(), row[1].strip()
         if not pattern:
             continue
-        if head and (category, pattern) in _RULES_CSV_HEADERS:
+        if head and _match_csv_header((category, pattern), _RULES_CSV_HEADERS):
             head = False
             continue
         head = False
@@ -717,6 +850,33 @@ async def _run_reload_hook(hook: Callable[[], Any] | None) -> str:
         return "ok" if result is not False else "failed"
     except Exception as exc:
         logger.warning("规则热重载钩子执行失败（响应仍正常返回）: %r", exc)
+        return "failed"
+
+
+async def _reload_keywords_after_write(container: Any) -> str:
+    """词库写库后热重载关键词引擎，归类结果：``ok`` / ``failed`` / ``skipped``。
+
+    与 :func:`_run_reload_hook` 的区别：词库重载经 ``container.reload_keywords()``
+    触发（该容器在 ``_register_keywords`` 作用域内，规则端点用的则是注入钩子）。
+    同步重载在**线程池**执行——词库可达数万条，AC 自动机重建不应阻塞事件循环
+    （PRD v0.5.0 缺陷修复：此前 dedup 端点亦为阻塞式内联调用）。
+
+    Args:
+        container: ``AppContext`` 容器（或其同类鸭子类型）；None / 缺方法时
+            返回 ``skipped``，端点仍正常返回。
+
+    Returns:
+        ``ok`` / ``failed`` / ``skipped``。
+    """
+
+    reload_keywords = getattr(container, "reload_keywords", None)
+    if not callable(reload_keywords):
+        return "skipped"
+    try:
+        ok = await run_in_threadpool(reload_keywords)
+        return "ok" if ok else "failed"
+    except Exception as exc:  # noqa: BLE001 - 重载失败不影响已落库的写操作
+        logger.warning("词库热重载失败（响应仍正常返回）: %r", exc)
         return "failed"
 
 
@@ -798,6 +958,50 @@ def create_admin_app(
         dependencies=[Depends(require_admin_token(token_store))],
     )
 
+    # 端点按域分发到各注册器（每个注册器 ≤400 行，见文件末 _register_*）
+    _register_keys(router, db=db)
+    _register_keywords(router, db=db, container=container, data_dir=data_dir)
+    _register_rules(router, db=db, reload_hook=reload_hook)
+    _register_review(router, reviewer=reviewer)
+    _register_whitelist(router, db=db, whitelist_dir=whitelist_dir)
+    _register_logs(router, db=db)
+    _register_vectors(router, data_dir=data_dir, rebuild_hook=rebuild_hook)
+    _register_config(router, db=db, container=container, reviewer=reviewer, config=config)
+    _register_runtime(router, db=db, container=container, downloads=downloads)
+
+    # ------------------------------------------ 全局异常处理（脱敏 JSON）
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        """HTTPException → 统一 JSON（error 字段；detail 非字符串时脱敏为通用文案）。"""
+
+        detail = exc.detail if isinstance(exc.detail, str) else "请求被拒绝"
+        return JSONResponse(status_code=exc.status_code, content={"error": detail})
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """请求参数校验失败 → 422 脱敏 JSON（不回字段细节，防内部结构泄露）。"""
+
+        return JSONResponse(status_code=422, content={"error": "请求参数校验失败"})
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        """未预期异常 → 500 脱敏 JSON：完整堆栈只进日志（logger.exception），不回响应。"""
+
+        logger.exception("管理 API 内部异常: %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"error": "服务器内部错误"})
+
+    app.include_router(router)
+    return app
+
+
+# ============================================================ 端点注册器（按域拆分）
+
+
+def _register_keys(router: APIRouter, db: Any) -> None:
+    """注册 Key 管理（/admin/keys）。"""
+
     # ------------------------------------------------------------- keys CRUD
     @router.post("/keys", status_code=201)
     async def create_key(body: KeyCreate) -> dict[str, Any]:
@@ -858,15 +1062,24 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail=f"API Key 不存在: {_mask_key(resolved)}")
         return {"deleted": _mask_key(resolved)}
 
+
+def _register_keywords(router: APIRouter, db: Any, container: Any, data_dir: Any) -> None:
+    """注册 词库（/admin/keywords）。"""
+
     # -------------------------------------------------------------- keywords
     @router.post("/keywords/import")
     async def import_keywords(
         file: Annotated[UploadFile, File(description="CSV（类别,词 两列）或 TXT（每行一词）")],
         category: Annotated[str | None, Query(description="TXT 导入必填的类别（每行一词）")] = None,
     ) -> dict[str, Any]:
-        """批量导入词条：``.csv`` 按「类别,词」两列解析（首行表头自动跳过），
-        其他扩展名按 TXT 解析（每行一词 + 必填 ``category`` 参数）；重复词条
-        （category+word 唯一）跳过并计数，不静默覆盖。"""
+        """批量导入词条：``.csv`` 按「类别,词」两列解析（首行表头自动跳过，
+        中英文别名均可、大小写不敏感），其他扩展名按 TXT 解析（每行一词 + 必填
+        ``category`` 参数）；重复词条（category+word 唯一）跳过并计数，不静默覆盖。
+
+        写库后**热重载关键词引擎**（``reload`` ∈ ok | failed | skipped），使新词
+        无需重启即时参与审核；未注入容器时为 ``skipped``。重载失败不回滚已落库
+        的导入（PRD v0.5.0 缺陷修复：此前该端点漏调重载，新违禁词在重启前不生效）。
+        """
 
         raw = await file.read()
         try:
@@ -883,8 +1096,20 @@ def create_admin_app(
             if not category:
                 raise HTTPException(status_code=400, detail="TXT 导入必须提供 category 查询参数")
             items = _parse_keywords_txt(text, category)
-        inserted, skipped = db.add_keywords(items)
-        return {"inserted": inserted, "skipped": skipped, "total": inserted + skipped}
+        # PRD v0.4.0 M0：导入预处理（+ 组合词 / 谐音归并）
+        processed = preprocess_keyword_items(items)
+        rows = [(item["category"], item["word"], item["source"]) for item in processed]
+        inserted, skipped = db.add_keywords(rows)
+        result: dict[str, Any] = {
+            "inserted": inserted,
+            "skipped": skipped,
+            "total": inserted + skipped,
+            "reload": await _reload_keywords_after_write(container),
+        }
+        and_rules = sum(1 for item in processed if item["match_type"] == "and")
+        if and_rules:
+            result["and_rules"] = and_rules
+        return result
 
     @router.get("/keywords")
     async def list_keywords(
@@ -903,11 +1128,16 @@ def create_admin_app(
 
     @router.delete("/keywords/{keyword_id}")
     async def delete_keyword(keyword_id: int) -> dict[str, Any]:
-        """按主键删除单个词条；不存在返回 404。"""
+        """按主键删除单个词条；不存在返回 404。
+
+        删除成功后**热重载关键词引擎**（``reload`` ∈ ok | failed | skipped），
+        使被删词条无需重启即不再参与审核（PRD v0.5.0 缺陷修复：此前漏调重载，
+        删除后旧词在重启前仍会命中）。
+        """
 
         if not db.delete_keyword(keyword_id):
             raise HTTPException(status_code=404, detail=f"词条不存在: id={keyword_id}")
-        return {"deleted": keyword_id}
+        return {"deleted": keyword_id, "reload": await _reload_keywords_after_write(container)}
 
     @router.post("/keywords/dedup")
     async def dedup_keywords() -> dict[str, Any]:
@@ -924,13 +1154,12 @@ def create_admin_app(
         except Exception as exc:  # noqa: BLE001 - 备份失败必须中止，防止无兜底去重
             raise HTTPException(status_code=500, detail=f"去重前备份失败，已中止：{exc}") from exc
         result = db.dedup_keywords()
-        reload = "skipped"
-        if container is not None:
-            try:
-                reload = "ok" if container.reload_keywords() else "failed"
-            except Exception:  # noqa: BLE001 - 重载失败不影响去重结果
-                reload = "failed"
+        reload = await _reload_keywords_after_write(container)
         return {"status": "ok", **result, "failed": 0, "backup_file": backup_file, "reload": reload}
+
+
+def _register_rules(router: APIRouter, db: Any, reload_hook: Any) -> None:
+    """注册 正则消歧规则（/admin/rules）。"""
 
     # ------------------------------------------------------------- rules
     @router.get("/rules")
@@ -1021,6 +1250,10 @@ def create_admin_app(
             "reload": await _run_reload_hook(reload_hook),
         }
 
+
+def _register_review(router: APIRouter, reviewer: Any) -> None:
+    """注册 定时复核（/admin/review）。"""
+
     # ------------------------------------------------------------- review
     @router.post("/review/run")
     async def run_review() -> dict[str, Any]:
@@ -1062,7 +1295,28 @@ def create_admin_app(
             )
         return reviewer.status()
 
+
+def _register_whitelist(router: APIRouter, db: Any, whitelist_dir: Any) -> None:
+    """注册 图片白名单（/admin/whitelist/images）。"""
+
     # ------------------------------------------------------ whitelist images
+    @router.get("/whitelist/images/{entry_id}/file")
+    async def whitelist_image_file(entry_id: int) -> Any:
+        """返回白名单原图文件（PRD v0.4.0 M5：前端列表显示真实缩略图）。
+
+        原图存 ``data/whitelist/{md5}.png``；DB 无记录或磁盘文件缺失时 404。
+        """
+        rows = db.list_whitelist()
+        row = next((r for r in rows if r["id"] == entry_id), None)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"白名单条目不存在: id={entry_id}")
+        target = whitelist_dir / f"{row['md5']}{_WHITELIST_EXT}"
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"白名单原图文件缺失: {target.name}")
+        from fastapi.responses import FileResponse
+
+        return FileResponse(str(target), media_type="image/png", filename=target.name)
+
     @router.post("/whitelist/images")
     async def upload_whitelist_images(
         files: Annotated[list[UploadFile], File(description="多张白名单图片（PNG/JPEG/GIF 等）")],
@@ -1128,6 +1382,10 @@ def create_admin_app(
         with contextlib.suppress(OSError):
             target.unlink()
         return {"deleted": entry_id, "file_deleted": file_deleted, "file": str(target)}
+
+
+def _register_logs(router: APIRouter, db: Any) -> None:
+    """注册 审核日志（/admin/logs）。"""
 
     # ------------------------------------------------------------ audit logs
     @router.get("/logs")
@@ -1217,6 +1475,10 @@ def create_admin_app(
             headers={"Content-Disposition": 'attachment; filename="audit_logs.csv"'},
         )
 
+
+def _register_vectors(router: APIRouter, data_dir: Any, rebuild_hook: Any) -> None:
+    """注册 向量库重建（/admin/vectors/rebuild）。"""
+
     # ----------------------------------------------------- vectors/rebuild
     @router.post("/vectors/rebuild")
     async def rebuild_vectors(body: RebuildBody | None = None) -> dict[str, Any]:
@@ -1248,6 +1510,12 @@ def create_admin_app(
             logger.exception("向量库重建失败: manifest=%s", manifest)
             raise HTTPException(status_code=500, detail=f"向量库重建失败：{exc}") from exc
         return {"status": "ok", "manifest": manifest, "result": result}
+
+
+def _register_config(
+    router: APIRouter, db: Any, container: Any, reviewer: Any, config: Any
+) -> None:
+    """注册 配置读写与热应用（/admin/config）。"""
 
     # -------------------------------------------- config 读写（v0.3.0 M4：DB 化 + 全量热应用）
     def _config_base() -> AppConfig:
@@ -1338,6 +1606,21 @@ def create_admin_app(
 
         return config_sources(_config_base(), db=db)
 
+    @router.get("/config/schema")
+    async def get_config_schema() -> dict[str, Any]:
+        """返回配置 schema（**单一来源**，PRD v0.5.0 P8）：分组 / 字段 / 类型 /
+        默认值 / 描述 / 密钥标记 / 应用方式（``kind``）。
+
+        由后端 ``AppConfig`` 反射生成（``config_override.config_schema``），
+        ``kind`` 取自 ``hot_apply.GROUP_REGISTRY``（param / rebuild / config_only）。
+        前端设置页据此对齐字段，避免手写字段清单与后端模型静默漂移。
+        """
+
+        schema = config_schema()
+        for group in schema.get("groups", []):
+            group["kind"] = hot_apply.GROUP_REGISTRY.get(group.get("name"), "unknown")
+        return schema
+
     @router.put("/config/{group}")
     async def update_config(group: str, payload: dict[str, Any]) -> dict[str, Any]:
         """更新单个配置分组：写 DB settings 并**立即热应用**（不重启）。
@@ -1423,6 +1706,10 @@ def create_admin_app(
             "sources": _group_sources(group),
             "deleted_db_group": is_delete,
         }
+
+
+def _register_runtime(router: APIRouter, db: Any, container: Any, downloads: Any) -> None:
+    """注册 运行时聚合（模型 / 健康 / 试运行 / 改密）。"""
 
     # ------------------------------------------ 运行时聚合（PRD v0.3.0 M2/M3/M5/M6，追加端点区）
     def _require_container() -> AppContext:
@@ -1525,7 +1812,10 @@ def create_admin_app(
             ),
         }
 
-        store = ctx.store
+        # 多向量库：懒加载当前 provider 对应的库（不强制常驻）
+        store = ctx.ensure_current_store()
+        store_name = ctx.store_name or "default"
+        store_path = str(ctx.store_paths.get(store_name, ""))
 
         def _pool_stat(pool: str) -> dict[str, Any]:
             if store is None:
@@ -1543,6 +1833,9 @@ def create_admin_app(
             "chinese_clip": clip,
             "fasttext": fasttext,
             "vector_store": {
+                "name": store_name,
+                "path": store_path,
+                "available": sorted(ctx.store_paths),
                 "black": _pool_stat("black"),
                 "white": _pool_stat("white"),
             },
@@ -1552,6 +1845,7 @@ def create_admin_app(
                 "reason": ctx.semantic_degraded_reason(),
                 "backend": emb_status["backend"],
             },
+            "providers": _provider_summary(cfg),
         }
 
     @router.post("/models/download", status_code=202)
@@ -1633,7 +1927,7 @@ def create_admin_app(
         ctx = _require_container()
         cfg = ctx.config
         db = ctx.database
-        store = ctx.store
+        store = ctx.ensure_current_store()
         light_ready = ctx.light_model is not None and not ctx.light_model.disabled
         llm_ready = ctx.llm is not None and ctx.llm.available
         keywords_n = len(db.list_keywords()) if db is not None else 0
@@ -1704,6 +1998,7 @@ def create_admin_app(
             "status": "ok",
             "version": __version__,
             "components": components,
+            "providers": _provider_summary(cfg),
             "degraded": list(ctx.degraded),
             "data": {
                 "keywords": keywords_n,
@@ -1757,6 +2052,8 @@ def create_admin_app(
             return await _test_embedding_channel(ctx, body.config)
         if body.channel == "llm":
             return await _test_llm_channel(ctx, body.config)
+        if body.channel == "rerank":
+            return await _test_rerank_channel(ctx, body.config)
         return _test_fasttext_channel(ctx, body.config)
 
     @router.post("/config/password")
@@ -1792,29 +2089,3 @@ def create_admin_app(
             "（若设置了 ADMIN_PASSWORD 环境变量，重启后以环境变量为准）",
             "persisted": True,
         }
-
-    # ------------------------------------------ 全局异常处理（脱敏 JSON）
-    @app.exception_handler(HTTPException)
-    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-        """HTTPException → 统一 JSON（error 字段；detail 非字符串时脱敏为通用文案）。"""
-
-        detail = exc.detail if isinstance(exc.detail, str) else "请求被拒绝"
-        return JSONResponse(status_code=exc.status_code, content={"error": detail})
-
-    @app.exception_handler(RequestValidationError)
-    async def _validation_exception_handler(
-        request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
-        """请求参数校验失败 → 422 脱敏 JSON（不回字段细节，防内部结构泄露）。"""
-
-        return JSONResponse(status_code=422, content={"error": "请求参数校验失败"})
-
-    @app.exception_handler(Exception)
-    async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        """未预期异常 → 500 脱敏 JSON：完整堆栈只进日志（logger.exception），不回响应。"""
-
-        logger.exception("管理 API 内部异常: %s %s", request.method, request.url.path)
-        return JSONResponse(status_code=500, content={"error": "服务器内部错误"})
-
-    app.include_router(router)
-    return app
