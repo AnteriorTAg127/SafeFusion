@@ -19,6 +19,10 @@ venv/
 ENV/
 .uv-cache/
 
+# Node / 前端依赖
+node_modules/
+.npm-cache/
+
 # 测试 / 质量工具缓存
 .pytest_cache/
 .pytest_tmp/
@@ -47,6 +51,26 @@ coverage.xml
 .vscode/
 *.swp
 *.swo
+
+# ===== 本地工具 / 临时文件 =====
+.codegraph/
+.cf_fail.txt
+.brooks-lint-history.json
+
+# vitest/vite 配置文件临时产物（启动时生成，非源码）
+*.timestamp-*.mjs
+
+# 会话附件目录（Harness 运行时产物，不入库）
+.dsh-im/
+
+# ===== 智能体工作区状态（本地记忆，不入库）=====
+.workbuddy/
+
+# ===== 通用临时 / 备份 =====
+*.bak
+*.orig
+*.tmp
+tmp/
 
 # ===== 操作系统 =====
 .DS_Store
