@@ -9,12 +9,12 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import numpy as np
 import pytest
 
+from safefusion.engines import failover as failover_mod
 from safefusion.engines.embedding import MultiEmbedding
 from safefusion.engines.failover import (
     AllProvidersFailed,
@@ -69,11 +69,24 @@ class TestFailoverCircuit:
         circuit.record_failure()
         assert not circuit.is_available()
 
-    def test_cooling_expires(self) -> None:
-        circuit = FailoverCircuit(max_failures=1, cooldown_seconds=0.05)
+    def test_cooling_expires(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """冷却到期后恢复可用（假时钟推进，不依赖真实 sleep 与时钟粒度）。
+
+        原用例 ``cooldown_seconds=0.05`` + ``sleep(0.06)`` 的余量仅 10ms，**小于**
+        ``time.monotonic()`` 的时钟粒度（Windows GetTickCount64 = 15.625ms）：
+        量化后可能仍判定「冷却中」——同一份代码在两次全量运行间翻转
+        （v0.5.0 实测先 689 passed、后 1 failed/688 passed）。改为注入假时钟后
+        判定完全确定，且顺带覆盖边界（未到期 / 刚到期）。
+        """
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(failover_mod, "monotonic", lambda: clock["t"])
+        circuit = FailoverCircuit(max_failures=1, cooldown_seconds=30)
         circuit.record_failure()
         assert not circuit.is_available()
-        time.sleep(0.06)
+        clock["t"] += 29.9  # 冷却未到
+        assert not circuit.is_available()
+        clock["t"] += 0.2  # 累计 30.1s ≥ 30s → 到期恢复
         assert circuit.is_available()
 
     def test_disabled_never_opens(self) -> None:
