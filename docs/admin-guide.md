@@ -19,9 +19,9 @@
 | GET | `/admin/keys` | 列出全部 Key：key 字段**脱敏**（前 8 位 + …）；无 last_used/rate_limit 列 | v0.1 |
 | PATCH | `/admin/keys/{key}` | 更新 Key：`{enabled?, note?}`（note 更新需存储层支持，否则 501）；`key` 支持完整明文或**唯一脱敏前缀**（前缀多命中 → 400） | v0.1（前缀匹配 v0.3.0） |
 | DELETE | `/admin/keys/{key}` | 删除 Key（支持完整 Key 或唯一前缀） | v0.1 |
-| POST | `/admin/keywords/import` | 批量导入词库：multipart `file`（CSV「类别,词」两列 / TXT 每行一词 + `category` 查询参数）；仅 UTF-8（可带 BOM） | v0.1 |
+| POST | `/admin/keywords/import` | 批量导入词库：multipart `file`（CSV「类别,词」两列 / TXT 每行一词 + `category` 查询参数）；仅 UTF-8（可带 BOM）；**CSV 表头中英文别名均可且大小写不敏感**（`类别,词` / `category,word` 等，仅首行判定）；写库后**热重载引擎** → `{inserted, skipped, total, reload}`（reload ∈ ok\|failed\|skipped） | v0.1（表头别名与热重载 v0.5.0） |
 | GET | `/admin/keywords` | 词库分页查询：`category? / page / page_size` → `{total, page, page_size, items[]}` | v0.1 |
-| DELETE | `/admin/keywords/{keyword_id}` | 按主键删除词条（404 不存在） | v0.1 |
+| DELETE | `/admin/keywords/{keyword_id}` | 按主键删除词条（404 不存在）；删除后**热重载引擎** → `{deleted, reload}` | v0.1（热重载 v0.5.0） |
 | **POST** | **`/admin/keywords/dedup`** | **一键去重（G10）**：先备份 zip 至 `data/backups/` → 按 (category,word) 去重 → 引擎热重载 → `{status, before, after, removed, failed, backup_file, reload}` | **v0.3.0** |
 | GET | `/admin/rules` | 规则列表：`category? / active_only(默认 true)` → `{total, items[]}` | v0.2 |
 | POST | `/admin/rules` | 批量新增：JSON 数组 `[{category,pattern,action,note}]` 或 multipart CSV；action 缺省 exempt；重复/非法 → 400 整批拒绝；写库后热重载 | v0.2 |
@@ -38,14 +38,14 @@
 | GET | `/admin/config` | 全量有效配置（按分组，Key 遮蔽为 `{api_key_env, configured}`） | v0.2.1 |
 | **GET** | **`/admin/config/sources`** | **叶子字段级来源映射 `{分组: {点分路径: default\|yaml\|db\|env}}`**（设置页来源徽标数据源） | **v0.3.0** |
 | PUT | `/admin/config/{group}` | 写 DB + **热应用**：部分键覆盖；空对象 `{}` 删除该组 DB（恢复默认）；失败回滚旧实例与 DB → 500/422；成功 → `{config, saved, applied, apply_scope, sources, deleted_db_group}` | v0.2.1（**v0.3.0 语义重构**） |
-| **GET** | **`/admin/models`** | **模型清单**：chinese-clip（状态/HF 缓存 blobs 与大小）、fasttext（配置/文件/可加载）、vector_store（黑白条数+维度）、semantic（装配状态+原因码） | **v0.3.0** |
+| **GET** | **`/admin/models`** | **模型清单**：chinese-clip（状态/HF 缓存 blobs 与大小）、fasttext（配置/文件/可加载）、vector_store（黑白条数+维度）、semantic（装配状态+原因码）、providers（embedding/llm/rerank 多提供者摘要） | **v0.3.0**（providers v0.4.0） |
 | **POST** | **`/admin/models/download`** | **后台下载 CLIP 权重**（202）：`{model_name?}` → `{task_id, status, reused, cache_dir}`；同模型互斥（进行中任务复用） | **v0.3.0** |
 | **GET** | **`/admin/models/download/{task_id}`** | **下载进度轮询**：`{status, stage, progress, downloaded_bytes, total_bytes, error}`（404 任务不存在） | **v0.3.0** |
 | **POST** | **`/admin/models/load`** | **显式装配语义层**（同步，含 300s 等待）：`{status, reason, message, semantic_ready, duration_s, summary}` | **v0.3.0** |
-| **GET** | **`/admin/health`** | **管理侧健康聚合**：`{status, version, components{8 组件}, degraded[], data{词库/向量黑白/白名单/规则}, cache, uptime_s}`；`degraded` 与 :8000 `/health` 同口径 | **v0.3.0** |
+| **GET** | **`/admin/health`** | **管理侧健康聚合**：`{status, version, components{8 组件}, providers, degraded[], data{词库/向量黑白/白名单/规则}, cache, uptime_s}`；`degraded` 与 :8000 `/health` 同口径 | **v0.3.0**（providers v0.4.0） |
 | **GET** | **`/admin/test-examples`** | **试运行示例**：从 `data/corpus/black.csv` / `white.csv` 头部（每池 ≤400 候选）随机抽 ≤20 条 ≤200 字符去重样本 → `{items:[{text,pool}], total}`；缺失不报错 | **v0.3.0** |
 | **POST** | **`/admin/test-audit`** | **管理端试运行审核**：契约同 `/v1/audit`，走管理令牌、固定 `tier=full` 返回完整 detail（复用缓存与审计日志管线） | **v0.3.0** |
-| **POST** | **`/admin/config/test-connection`** | **渠道冒烟测试**：`{channel: embedding\|llm\|fasttext, config?}`（`config` 为临时参数不落库、`api_key` 键剥离）→ `{channel, ok, message, detail}`；无 Key / 缺 base_url 有明确中文提示，全部失败不崩 | **v0.3.0** |
+| **POST** | **`/admin/config/test-connection`** | **渠道冒烟测试**：`{channel: embedding\|llm\|rerank\|fasttext, config?}`（`config` 为临时参数不落库、`api_key` 键剥离）→ `{channel, ok, message, detail}`；无 Key / 缺 base_url 有明确中文提示，全部失败不崩；`rerank` 对远程 ReRanker 发最小重排请求 | **v0.3.0**（rerank v0.4.0） |
 | **POST** | **`/admin/config/password`** | **改密（C5）**：`{current_password, new_password(≥10)}`；hmac 常数时间校验；通过后旧令牌**立即失效**，持久化 settings `admin.token`（重启后 env `ADMIN_PASSWORD` 仍最高优先） | **v0.3.0** |
 
 ## 3. Key 前缀匹配说明

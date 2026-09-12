@@ -5,7 +5,7 @@
 SafeFusion 以「基础规则 → 多模态语义检索 → LLM 兜底」分层漏斗，在低成本下实现文本 + 图片统一审核，追求够用的准确度与较低的误判违规率。核心设计是**一律汇总决策、无短路**，适用于社交平台内容审核（帖子配图、评论、头像等）等低成本低误判的内容风控场景。
 
 - **协议**：GPL-3.0（代码开源；训练与审核数据一律不开源，见[数据资产](#数据资产)）
-- **状态**：v0.3.0（易用性与可运维性大版本：配置 DB 化 + 全量热应用、模型懒加载按需下载、新前端管理面板）
+- **状态**：v0.4.0（多模型提供者 + 远程 ReRanker + 失败自动切换；含 v0.3.0 配置 DB 化/热应用/懒加载/前端面板）
 - **环境**：Python ≥ 3.10 · uv · FastAPI · SQLite · 自研 numpy 向量库 · Vue3+Vite（前端）
 
 ---
@@ -31,8 +31,8 @@ SafeFusion 以「基础规则 → 多模态语义检索 → LLM 兜底」分层�
    │
    ├─ ① 缓存层        审核缓存 / 高频缓存 / 图片去重缓存 / 短文本LLM缓存 / 永久黑白名单
    ├─ ② 基础规则层     图片白名单(pHash) │ 文本关键词(Aho-Corasick+拼音) → 正则消歧 │ 轻量文本风险模型(复用 fasttext.pt)
-   ├─ ③ 语义检索层     多模态Embedding(Chinese-CLIP/云端API) → 自研向量库黑白对抗检索 → 三信号置信度
-   ├─ ④ LLM 兜底层     OpenAI 兼容多模态 LLM，结构化 JSON 输出，失败回退语义层
+   ├─ ③ 语义检索层     多模态Embedding(Chinese-CLIP/云端API/多Provider) → 自研向量库黑白对抗检索 → 三/四信号置信度（可远程 ReRanker）
+   ├─ ④ LLM 兜底层     OpenAI 兼容多模态 LLM（多 Provider 自动切换），结构化 JSON 输出，失败回退语义层
    └─ ⑤ 编排与决策     汇总决策(无短路) → 三档置信度动作 → 请求级参数覆盖 → 写缓存/写审计
 ```
 
@@ -61,7 +61,7 @@ uv sync --extra ml # 可选：需要本地 Chinese-CLIP / fasttext 推理时安�
 
 ### 2. 配置
 
-复制 `config.example.yaml` 为 `config.yaml`，按需修改阈值与后端；加载顺序为**内置默认 → YAML → 数据库（管理端设置） → 环境变量**。**密钥类一律通过环境变量注入**：
+复制 `config.example.yaml` 为 `config.yaml`，按需修改阈值与后端，**启动时用 `--config` 指定该文件**（或用 `SAFEFUSION_CONFIG` 环境变量指向它）；加载顺序为**内置默认 → YAML → 数据库（管理端设置） → 环境变量**。**密钥类一律通过环境变量注入**：
 
 ```bash
 # Windows PowerShell
@@ -86,8 +86,15 @@ export HF_ENDPOINT="https://hf-mirror.com"
 双服务统一入口（审核 API :8000 / 管理 API :8001）：
 
 ```bash
+# 使用 YAML 配置（推荐；--config 优先于 SAFEFUSION_CONFIG 环境变量）
+.venv\Scripts\python.exe -m safefusion.api --config config.yaml
+
+# 不带参数 = 仅内置默认值 + 环境变量（不读取任何 YAML）
 .venv\Scripts\python.exe -m safefusion.api
 ```
+
+> 二者皆缺时**不会**自动发现当前目录的 `config.yaml`——需显式用 `--config` 或
+> `SAFEFUSION_CONFIG` 指定，避免读取到无关同名文件。
 
 启动日志会输出：
 

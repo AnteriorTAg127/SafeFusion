@@ -2,19 +2,38 @@
 
 本文件记录 SafeFusion 面向用户的版本变更（[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，版本号遵循语义化版本）。内部开发日志见 `开发/changelog.md`（不入库）；真实数据不在本仓库分发，见 README「数据资产」。
 
-## [0.2.2] - 2026-08-28
+## [Unreleased]
+
+### Fixed
+
+- **入口配置文件从未生效（严重）**：`python -m safefusion.api` 此前硬编码 `load_config(None)`，按 README / 部署文档创建的 `config.yaml` **静默不加载**（日志仅一行「忽略未识别的配置环境变量」）。现支持 `--config <path>`（优先）与 `SAFEFUSION_CONFIG` 环境变量；两者皆缺时仍为「内置默认 + 环境变量」，**不自动发现**同名文件
+- **词库导入 / 删除不热重载（严重）**：`POST /admin/keywords/import` 与 `DELETE /admin/keywords/{id}` 只写库、不触发热重载，新违禁词在进程重启前**完全不参与审核**（后台却回显「导入成功」，形成虚假成功反馈）。现两个端点写库后即时重载引擎，响应新增 `reload` 字段（`ok` / `failed` / `skipped`）
+- **陈旧审核结论（严重）**：审核缓存键不含知识库版本与生效阈值，改词库 / 规则或热改阈值后最长 1 小时仍返回按旧状态裁决的结论，且高频缓存（TTL 300s）构成第二条陈旧路径。现两级缓存键均纳入「知识库版本 + 生效配置指纹」，任何写入即自然失效
+- **关键词 CSV 表头只认中文**：英文表头 `category,word` 会被当作词条写入词库（脏数据参与 AC 构建，且 `word` 会误命中含该英文单词的文本）。现支持中英文别名且大小写不敏感，与规则 CSV 统一判定机制
+- **Redis 亚秒 TTL 用例的跨平台脆弱性**：两个用例使用 0.05 秒 TTL，经 `int()` 截断为 0（Redis `EXPIRE 0` 语义为立即删除），断言结果取决于 `time.monotonic()` 时钟粒度（Linux 必失败、Windows 常通过）。现改用整秒 TTL，并新增确定性用例固化「亚秒 TTL ⇒ 立即过期」契约
+
+### Changed
+
+- CHANGELOG 版本顺序修正为语义化版本降序（`0.2.2` 此前误排在 `0.3.0` 之前，并在其 Notes 中说明该历史命名遗留）
+
+## [0.4.0] - 2026-08-30
 
 ### Added
 
-- **向量库全量构建（v0.2.2 事项落地）**：189,262 条文本全部编码入库（black 96,786 + white 92,476），2048 维 L2 归一化，`data/vectors/` 双池 npz + meta + done_ids.json 断点续跑
-- **在线 Embedding 联调（llama.cpp 本地服务）**：`CloudEmbeddingAPI` 新增 `allow_no_key`（无鉴权本地服务如 `llama-server --embeddings` 免 Key，默认 False 保留云端强制 Key 安全语义）；`build_vector_db.py` 新增 `--backend cloud`（`--base-url` / `--cloud-model` / `--no-api-key` / `--cloud-timeout`）
-- **群聊白语料并入**：`scripts/merge_manifest.py` 将 `white_groupchat.csv`（53,341 条）并入向量导入清单（池内 `(pool,text)` 去重、幂等、`--dry-run`）
-- **测试**：新增 allow_no_key 用例与 build_vector_db cloud 参数解析用例；581 pytest 全绿、ruff 全绿
+- **多模型提供者（Embedding + LLM）**：`providers` / `active_provider` / `failover` 配置；每个提供者可配独立后端/模型/优先级；失败自动切换 + 熔断冷却
+- **远程 ReRanker（`rerank` 分组）**：支持本地 CLIP 与云端 `POST /rerank` 两种提供者；响应兼容 `results` / `data`；总开关沿用 `semantic.rerank_enabled`
+- **Rerank 热应用**：设置页保存 rerank 分组即重建语义引擎，无需重启
+- **词库导入预处理**：`+` 复合词解析为组合规则；同音谐音词归并；管理端导入与 `normalize_assets.py` 同时生效
+- **语义 Top-K 可配置**：`thresholds.top_k / black_top_k / white_top_k`，前端阈值分组可改
+- **多向量库懒加载**：`embedding.vector_stores` + provider 映射；启动只登记路径、按需加载、LRU 容量 2；旧 `data/vectors` 自动复用
+- **llama.cpp 多模态图片 Embedding 协议**：`embedding.cloud.image_protocol=llamacpp`
+- **管理端**：`GET /admin/models`、`GET /admin/health` 新增 `providers` 摘要；`POST /admin/config/test-connection` 新增 `channel=rerank`
+- **前端体验与可靠性修复（F1~F13）**：白名单缩略图 blob 鉴权拉取、分级超时、竞态/重入防护、client 与 router 解耦、顶栏服务状态、登出/弹窗/Toast 可用性、SettingsView 拆分、vitest 纯逻辑单测
 
-### Notes
+### Changed
 
-- 向量库构建由脚本完成，管理端仅状态查看（`/admin/models`）；图片语料待用户提供后经 `normalize_assets.py --images-dir` 并入图片清单再增量构建
-- 构建使用 5545 端口的 WeMM-Embedding-2B-Q4_K_M（llama.cpp，2048 维），耗时约数小时；中断后重跑 `build_vector_db.py` 自动续跑
+- 配置分组由 11 个增至 12 个（新增 `rerank`）
+- `semantic.rerank_enabled=true` 且 `rerank.providers` 非空时，Rerank 由多提供者路由
 
 ## [0.3.0] - 2026-08-27
 
@@ -37,6 +56,21 @@
 - 模型装配失败**不自动重试**，需在设置页「模型卡」或 `/admin/models/load` 显式重试；本地装配一律 `local_files_only` 只读缓存、绝不因装配联网下载（下载走 download 端点）
 - 审核日志仍不落原文全文（隐私权衡）；试运行走业务管线（会写审计日志）
 - 向量库构建（`build_vector_db.py`）与在线 embedding 联调仍按用户决策延后（v0.2.2 事项；本期完成数据侧全部准备：语料/图片清单/guardian 规则）
+
+## [0.2.2] - 2026-08-28
+
+### Added
+
+- **向量库全量构建（v0.2.2 事项落地）**：189,262 条文本全部编码入库（black 96,786 + white 92,476），2048 维 L2 归一化，`data/vectors/` 双池 npz + meta + done_ids.json 断点续跑
+- **在线 Embedding 联调（llama.cpp 本地服务）**：`CloudEmbeddingAPI` 新增 `allow_no_key`（无鉴权本地服务如 `llama-server --embeddings` 免 Key，默认 False 保留云端强制 Key 安全语义）；`build_vector_db.py` 新增 `--backend cloud`（`--base-url` / `--cloud-model` / `--no-api-key` / `--cloud-timeout`）
+- **群聊白语料并入**：`scripts/merge_manifest.py` 将 `white_groupchat.csv`（53,341 条）并入向量导入清单（池内 `(pool,text)` 去重、幂等、`--dry-run`）
+- **测试**：新增 allow_no_key 用例与 build_vector_db cloud 参数解析用例；581 pytest 全绿、ruff 全绿
+
+### Notes
+
+- **版本序说明**：本补丁的实际发布日期（08-28）**晚于** `0.3.0`（08-27），即历史发布顺序为 `0.3.0 → 0.2.2`；这是早期命名遗留（按语义化版本本应命名为 `0.3.1`）。自 `0.4.0` 起版本号已单调递增，本节在 CHANGELOG 中按语义化版本降序排列于 `0.3.0` 之后
+- 向量库构建由脚本完成，管理端仅状态查看（`/admin/models`）；图片语料待用户提供后经 `normalize_assets.py --images-dir` 并入图片清单再增量构建
+- 构建使用 5545 端口的 WeMM-Embedding-2B-Q4_K_M（llama.cpp，2048 维），耗时约数小时；中断后重跑 `build_vector_db.py` 自动续跑
 
 ## [0.2.1] - 2026-08-27
 

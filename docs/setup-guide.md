@@ -14,7 +14,7 @@ uv sync --extra ml # 可选：需要本地 Chinese-CLIP / fasttext 推理时安�
 
 ## 2. 配置
 
-复制 `config.example.yaml` 为 `config.yaml`，按需修改阈值与后端；加载顺序为**内置默认 → YAML → 数据库（管理端设置） → 环境变量**。**密钥类一律通过环境变量注入**：
+复制 `config.example.yaml` 为 `config.yaml`，按需修改阈值与后端，**启动时用 `--config` 指定该文件**（或用 `SAFEFUSION_CONFIG` 环境变量指向它）；加载顺序为**内置默认 → YAML → 数据库（管理端设置） → 环境变量**。**密钥类一律通过环境变量注入**：
 
 ```bash
 # Windows PowerShell
@@ -39,8 +39,18 @@ export HF_ENDPOINT="https://hf-mirror.com"
 双服务统一入口（审核 API :8000 / 管理 API :8001）：
 
 ```bash
+# 使用 YAML 配置（推荐；--config 优先于 SAFEFUSION_CONFIG 环境变量）
+.venv\Scripts\python.exe -m safefusion.api --config config.yaml
+
+# 或经环境变量指定
+$env:SAFEFUSION_CONFIG="config.yaml"; .venv\Scripts\python.exe -m safefusion.api
+
+# 不带参数 = 仅内置默认值 + 环境变量（不读取任何 YAML）
 .venv\Scripts\python.exe -m safefusion.api
 ```
+
+> 二者皆缺时**不会**自动发现当前目录的 `config.yaml`——需显式用 `--config` 或
+> `SAFEFUSION_CONFIG` 指定，避免读取到无关同名文件。
 
 启动日志会输出：
 
