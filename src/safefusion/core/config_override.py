@@ -67,6 +67,9 @@ _RANGE_RULES: dict[str, dict[str, tuple[float, float]]] = {
         "margin_w": (0.0, 1.0),
         "confidence_low": (0.0, 1.0),
         "confidence_high": (0.0, 1.0),
+        "top_k": (1, 50),
+        "black_top_k": (1, 50),
+        "white_top_k": (1, 50),
     },
     "semantic": {
         "rerank_w_top": (0.0, 1.0),
@@ -384,6 +387,12 @@ def _validate_business_rules(
                 raise ValueError(
                     "backend=cloud 时 embedding.cloud 必填字段缺失: " + ", ".join(missing)
                 )
+            image_protocol = str(cloud.get("image_protocol") or "openai").lower()
+            if image_protocol not in ("openai", "llamacpp"):
+                raise ValueError(
+                    f"未知 embedding.cloud.image_protocol: {image_protocol!r}"
+                    "（可选 openai / llamacpp）"
+                )
             if fuse_mode in ("weighted_avg", "pool"):
                 raise ValueError(
                     "fuse_mode="
@@ -396,10 +405,64 @@ def _validate_business_rules(
             local = validated.get("local") or {}
             if not str(local.get("model_name") or "").strip():
                 raise ValueError("embedding.local.model_name 不能为空")
+
+        # 多向量库：名称唯一、provider 引用的 vector_store 必须存在
+        stores = validated.get("vector_stores") or []
+        store_names = [str(s.get("name") or "") for s in stores]
+        if len(store_names) != len(set(store_names)):
+            raise ValueError("embedding.vector_stores 名称必须唯一")
+        providers = validated.get("providers") or []
+        for provider in providers:
+            vs = provider.get("vector_store")
+            if vs is not None and vs not in store_names:
+                raise ValueError(
+                    f"embedding.providers[].vector_store 引用了不存在的向量库: {vs!r}"
+                    f"（可选: {', '.join(store_names) or '（未配置）'}）"
+                )
     elif group == "cache":
         backend = validated["backend"]
         if backend not in ("memory", "redis"):
             raise ValueError(f"未知 cache.backend: {backend!r}（可选 memory / redis）")
+    elif group == "llm":
+        providers = validated.get("providers") or []
+        names = [str(p.get("name") or "") for p in providers]
+        if len(names) != len(set(names)):
+            raise ValueError("llm.providers 名称必须唯一")
+        for p in providers:
+            if not str(p.get("base_url") or "").strip():
+                raise ValueError(f"llm.providers[].base_url 不能为空（提供者 {p.get('name')!r}）")
+            if not str(p.get("model") or "").strip():
+                raise ValueError(f"llm.providers[].model 不能为空（提供者 {p.get('name')!r}）")
+        active = validated.get("active_provider")
+        if active is not None and active not in names:
+            options = ", ".join(names) or "（未配置）"
+            raise ValueError(
+                f"llm.active_provider {active!r} 不在 llm.providers 中（可选: {options}）"
+            )
+    elif group == "rerank":
+        providers = validated.get("providers") or []
+        names = [str(p.get("name") or "") for p in providers]
+        if len(names) != len(set(names)):
+            raise ValueError("rerank.providers 名称必须唯一")
+        for p in providers:
+            provider_type = str(p.get("type") or "local").lower()
+            if provider_type not in ("local", "cloud"):
+                raise ValueError(
+                    f"未知 rerank.providers[].type: {provider_type!r}（可选 local / cloud）"
+                )
+            if provider_type == "cloud":
+                missing = [k for k in ("base_url", "model") if not str(p.get(k) or "").strip()]
+                if missing:
+                    raise ValueError(
+                        f"rerank.providers[].type=cloud 必填字段缺失: {', '.join(missing)}"
+                        f"（提供者 {p.get('name')!r}）"
+                    )
+        active = validated.get("active_provider")
+        if active is not None and active not in names:
+            raise ValueError(
+                f"rerank.active_provider {active!r} 不在 rerank.providers 中"
+                f"（可选: {', '.join(names) or '（未配置）'}）"
+            )
     elif group == "semantic":
         embedding_backend = effective.embedding.backend
         if embedding_backend == "cloud" and fuse_mode in ("weighted_avg", "pool"):
@@ -758,3 +821,112 @@ def _strip_pydantic(exc: ValidationError) -> str:
 
     first = exc.errors()[0]
     return f"{'.'.join(str(p) for p in first.get('loc', ()))}: {first.get('msg', '')}"
+
+
+# ------------------------------------------------------- 配置 schema（单一来源，P8）
+
+
+def _walk_model(model: Any, prefix: str = ""):
+    """递归遍历**分组模型类**的标量叶子，产出 ``(路径, 注解, 默认值, 描述)``。
+
+    嵌套 pydantic 子模型逐层下钻（路径以 ``.`` 连接），含 ``X | None`` 形式的
+    可选子模型（下钻到其内部字段，而非把整个模型当成一个叶子）；列表 / 字典等
+    容器字段作为叶子产出（不深入元素模型，避免 provider 列表爆炸）。
+    """
+
+    from types import UnionType
+    from typing import Union, get_args, get_origin, get_type_hints
+
+    # 后定义的嵌套模型在 pydantic 字段里可能是 ForwardRef（"X"），用 get_type_hints
+    # 在模块命名空间下解析（config.py 中 RedisCacheConfig / AnimatedImageConfig 晚于
+    # 宿主模型定义），否则会被误判为标量叶子。
+    try:
+        hints = get_type_hints(model)
+    except Exception:
+        hints = {}
+
+    for name, field in model.model_fields.items():
+        ann = hints.get(name, field.annotation)
+        path = f"{prefix}{name}"
+        inner = ann
+        if get_origin(ann) in (Union, UnionType):
+            non_none = [a for a in get_args(ann) if a is not type(None)]
+            if len(non_none) == 1:
+                inner = non_none[0]
+        if isinstance(inner, type) and issubclass(inner, BaseModel):
+            yield from _walk_model(inner, f"{path}.")
+            continue
+        try:
+            default = field.get_default(call_default_factory=True)
+        except Exception:
+            default = None
+        yield path, ann, default, (field.description or "")
+
+
+def _type_name(ann: Any) -> str:
+    """把注解归类为前端可识别的简单类型名（``X | None`` → ``X|null``）。"""
+
+    from types import UnionType
+    from typing import Union, get_args, get_origin
+
+    if ann is None:
+        return "any"
+    origin = get_origin(ann)
+    if origin in (list, tuple, set, frozenset):
+        return "list"
+    if origin is dict:
+        return "dict"
+    if origin in (Union, UnionType):
+        inner = [a for a in get_args(ann) if a is not type(None)]
+        base = _type_name(inner[0]) if inner else "any"
+        return f"{base}|null"
+    if isinstance(ann, type) and issubclass(ann, BaseModel):
+        return "object"
+    if isinstance(ann, type):
+        return ann.__name__
+    return str(ann)
+
+
+def _jsonable(value: Any) -> Any:
+    """把默认值转为可 JSON 序列化形态（不可序列化者退化为 str）。"""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    return str(value)
+
+
+def config_schema() -> dict[str, Any]:
+    """反射 ``AppConfig`` 生成配置 schema（分组 / 字段 / 类型 / 默认值 / 描述 / 密钥标记）。
+
+    **单一来源**（Brooks-Lint P8）：前端设置页据此对齐字段元数据，避免
+    ``configFields.ts`` 与后端模型静默漂移（后端新增字段而面板改不了）。
+    返回结构::
+
+        {"groups": [{"name": "thresholds",
+                     "fields": [{"path": "semantic_threshold", "type": "float",
+                                 "default": 0.67, "description": "...", "secret": False}]}]}
+
+    密钥叶子（``api_key``）以 ``secret=True`` 标记——前端应只读展示来源，不可写入。
+    """
+
+    groups: list[dict[str, Any]] = []
+    for group in get_config_groups():
+        model = _group_model(group)
+        if model is None:
+            continue
+        fields = [
+            {
+                "path": path,
+                "type": _type_name(ann),
+                "default": _jsonable(default),
+                "description": description,
+                "secret": _is_secret_leaf(f"{group}.{path}"),
+            }
+            for path, ann, default, description in _walk_model(model)
+        ]
+        groups.append({"name": group, "fields": fields})
+    return {"groups": groups}

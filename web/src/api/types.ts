@@ -101,7 +101,8 @@ export interface AuditResult {
   request_id: string
   timestamp: string
   has_violation: boolean
-  confidence: number
+  /** 综合置信度（0~1）；为 null 表示无值（语义降级 / standard 渠道），渲染「—」（F9） */
+  confidence: number | null
   category: string | null
   source: AuditSource
   cache_hit: boolean
@@ -118,4 +119,33 @@ export interface TrialExample {
 export interface ExamplesResponse {
   items: TrialExample[]
   total: number
+}
+
+// ---------------- 配置 schema（GET /admin/config/schema，v0.5.0 P8 单一来源） ----------------
+
+/** 单个配置字段的元数据（由后端 AppConfig 反射生成） */
+export interface ConfigFieldSchema {
+  /** 分组内相对路径（嵌套子模型用点连接，如 cloud.base_url） */
+  path: string
+  /** 简单类型名：bool / int / float / str / list / dict / object（可带 |null） */
+  type: string
+  /** 后端默认值 */
+  default: unknown
+  /** 字段描述（config.py description） */
+  description: string
+  /** 密钥叶子标记（前端只读展示来源，不可写入） */
+  secret: boolean
+}
+
+/** 单个配置分组（含应用方式 kind） */
+export interface ConfigGroupSchema {
+  name: string
+  /** 热应用方式：param / rebuild / config_only（hot_apply.GROUP_REGISTRY） */
+  kind?: string
+  fields: ConfigFieldSchema[]
+}
+
+/** GET /admin/config/schema 响应 */
+export interface ConfigSchema {
+  groups: ConfigGroupSchema[]
 }

@@ -40,7 +40,7 @@ from safefusion.core.context import AppContext
 from safefusion.engines.image_pipeline import WhitelistMatcher
 from safefusion.storage.database import Database
 
-from .fakes import FakeEmbedding
+from .fakes import FakeEmbedding, FakeLLM
 
 api_main = importlib.import_module("safefusion.api.__main__")
 
@@ -113,9 +113,17 @@ class TestGetConfigMasking:
         body = resp.json()
         for group in ("embedding", "llm", "thresholds", "cache", "keyword", "semantic", "review"):
             assert group in body
-        # embedding 按 {backend, local, cloud} 结构对齐 config.py
+        # embedding 按 backend/local/cloud/providers/active_provider/failover/vector_stores 对齐
         assert body["embedding"]["backend"] == "local"
-        assert set(body["embedding"].keys()) == {"backend", "local", "cloud"}
+        assert set(body["embedding"].keys()) == {
+            "backend",
+            "local",
+            "cloud",
+            "providers",
+            "active_provider",
+            "failover",
+            "vector_stores",
+        }
         # 语义组 fuse_mode 默认 pool（v0.3.0 起为真实叶子，默认值一致）
         assert body["semantic"]["fuse_mode"] == "pool"
 
@@ -416,6 +424,106 @@ class TestPutConfig:
         assert resp.status_code == 422
         assert "不能为空" in resp.json()["error"]
 
+    def test_put_rerank_providers_valid(
+        self, admin_client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # rerank 是参数类分组（无组件重建），只需校验并落库
+        resp = admin_client.put(
+            "/admin/config/rerank",
+            json={
+                "providers": [
+                    {"name": "local-clip", "type": "local", "priority": 1},
+                    {
+                        "name": "cloud-jina",
+                        "type": "cloud",
+                        "base_url": "https://api.example.com/v1",
+                        "model": "jina-reranker-v2",
+                        "priority": 2,
+                    },
+                ],
+                "active_provider": "cloud-jina",
+            },
+            headers=_headers(),
+        )
+        assert resp.status_code == 200
+        got = admin_client.get("/admin/config", headers=_headers()).json()
+        assert got["rerank"]["active_provider"] == "cloud-jina"
+        assert len(got["rerank"]["providers"]) == 2
+        assert got["rerank"]["providers"][0]["type"] == "local"
+
+    def test_put_rerank_invalid_cloud_missing_fields_422(self, admin_client) -> None:
+        resp = admin_client.put(
+            "/admin/config/rerank",
+            json={"providers": [{"name": "bad", "type": "cloud"}]},
+            headers=_headers(),
+        )
+        assert resp.status_code == 422
+        assert "必填字段缺失" in resp.json()["error"]
+
+    def test_put_rerank_unknown_type_422(self, admin_client) -> None:
+        resp = admin_client.put(
+            "/admin/config/rerank",
+            json={"providers": [{"name": "bad", "type": "banana"}]},
+            headers=_headers(),
+        )
+        assert resp.status_code == 422
+        assert "可选 local / cloud" in resp.json()["error"]
+
+    def test_put_llm_providers_valid(self, admin_client, monkeypatch: pytest.MonkeyPatch) -> None:
+        # llm 是重建类分组；monkeypatch build_llm 避免真实客户端不可用
+        monkeypatch.setattr(hot_apply, "build_llm", lambda _cfg: FakeLLM())
+        resp = admin_client.put(
+            "/admin/config/llm",
+            json={
+                "providers": [
+                    {
+                        "name": "openai",
+                        "base_url": "https://api.openai.com/v1",
+                        "model": "gpt-x",
+                        "priority": 1,
+                    },
+                    {
+                        "name": "deepseek",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "model": "deepseek-chat",
+                        "priority": 2,
+                    },
+                ],
+                "active_provider": "deepseek",
+            },
+            headers=_headers(),
+        )
+        assert resp.status_code == 200
+        got = admin_client.get("/admin/config", headers=_headers()).json()
+        assert got["llm"]["active_provider"] == "deepseek"
+        assert len(got["llm"]["providers"]) == 2
+
+    def test_put_llm_providers_duplicate_name_422(self, admin_client) -> None:
+        resp = admin_client.put(
+            "/admin/config/llm",
+            json={
+                "providers": [
+                    {"name": "a", "base_url": "http://a", "model": "m"},
+                    {"name": "a", "base_url": "http://b", "model": "m2"},
+                ]
+            },
+            headers=_headers(),
+        )
+        assert resp.status_code == 422
+        assert "名称必须唯一" in resp.json()["error"]
+
+    def test_put_llm_active_provider_missing_422(self, admin_client) -> None:
+        resp = admin_client.put(
+            "/admin/config/llm",
+            json={
+                "providers": [{"name": "a", "base_url": "http://a", "model": "m"}],
+                "active_provider": "nope",
+            },
+            headers=_headers(),
+        )
+        assert resp.status_code == 422
+        assert "不在 llm.providers 中" in resp.json()["error"]
+
 
 class TestStaticMount:
     """web/dist 静态托管（PRD 风险表：不存在时无影响；存在时挂载且不吞 /admin/*）。"""
@@ -446,5 +554,23 @@ class TestStaticMount:
         assert client.get("/admin/keys", headers=_headers()).status_code == 200
         assert client.get("/", headers=_headers()).status_code == 200
         assert "sf-panel" in client.get("/", headers=_headers()).text
+        client.close()
+        db.close()
+
+    def test_spa_history_route_falls_back_to_index(self, tmp_path: Path) -> None:
+        db = Database(tmp_path / "audit.db")
+        matcher = WhitelistMatcher(db)
+        admin_app = create_admin_app(db, matcher, config=_DuckCfg(tmp_path))
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html>sf-panel</html>", encoding="utf-8")
+        assert api_main.maybe_mount_web_dist(admin_app, dist) is True
+        client = TestClient(admin_app)
+        # 前端 history 路由：直接访问 /trial 应回退 index.html，而不是 404
+        resp = client.get("/trial")
+        assert resp.status_code == 200
+        assert "sf-panel" in resp.text
+        # API 路径仍不被静态回退吞掉
+        assert client.get("/admin/keys", headers=_headers()).status_code == 200
         client.close()
         db.close()

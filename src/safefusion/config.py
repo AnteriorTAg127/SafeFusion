@@ -54,6 +54,9 @@ class ThresholdsConfig(_BaseConfig):
     confidence_high: float = Field(default=0.75, description="置信度高档下界，高于则判定违规")
     phash_whitelist_distance: int = Field(default=5, description="图片白名单 pHash 汉明距离阈值")
     phash_dedup_distance: int = Field(default=3, description="图片去重缓存近似命中 pHash 阈值")
+    top_k: int = Field(default=5, description="语义检索 Top-K（黑/白库默认召回数，范围 1~50）")
+    black_top_k: int | None = Field(default=None, description="黑库独立 Top-K；null 跟随 top_k")
+    white_top_k: int | None = Field(default=None, description="白库独立 Top-K；null 跟随 top_k")
 
 
 class EmbeddingLocalConfig(_BaseConfig):
@@ -68,7 +71,7 @@ class EmbeddingLocalConfig(_BaseConfig):
 
 
 class EmbeddingCloudConfig(_BaseConfig):
-    """云端 Embedding API 后端配置（OpenAI 兼容风格）。"""
+    """云端 Embedding API 后端配置（OpenAI 兼容风格 + llama.cpp 多模态兼容）。"""
 
     base_url: str | None = Field(default=None, description="云端 Embedding API base_url")
     model: str | None = Field(default=None, description="云端 embedding 模型名")
@@ -81,10 +84,61 @@ class EmbeddingCloudConfig(_BaseConfig):
         default=False,
         description="本地无鉴权服务（如 llama.cpp --embeddings）允许无 Key；默认 False 强制 Key",
     )
+    image_protocol: str = Field(
+        default="openai",
+        description=(
+            "云端图片 Embedding 协议：openai（默认，/v1/embeddings + input + data URI）"
+            "| llamacpp（/embeddings + content + multimodal_data + 动态 media_marker）"
+        ),
+    )
+    image_max_side: int = Field(
+        default=1024,
+        description="云端图片 Embedding 发送前最长边缩放上限（px）；0 表示不缩放",
+    )
+    image_quality: int = Field(
+        default=85,
+        description="云端图片 Embedding JPEG 压缩质量（1~95）；越大越清晰但 base64 越大",
+    )
+
+
+class FailoverConfig(_BaseConfig):
+    """失败自动切换熔断参数（PRD v0.4.0 M1/M3，各模型分组通用）。"""
+
+    enabled: bool = Field(default=True, description="是否启用熔断；false 时只做失败切换不冷却")
+    cooldown_seconds: float = Field(
+        default=30.0, description="熔断冷却时长（秒），达到 max_failures 后冷却期内跳过该提供者"
+    )
+    max_failures: int = Field(default=3, description="连续失败多少次后进入冷却")
+
+
+class VectorStoreConfig(_BaseConfig):
+    """向量库配置：唯一名称 + 持久化目录（相对 data_dir）。"""
+
+    name: str = Field(description="向量库唯一名称（供 embedding provider 映射）")
+    path: str = Field(description="向量库目录（相对 data_dir，如 vectors/wemm）")
+
+
+class EmbeddingProviderConfig(_BaseConfig):
+    """Embedding 提供者（渠道/模型）配置。
+
+    ``vector_store`` 指定该提供者使用的向量库名称（须在
+    ``embedding.vector_stores`` 中；缺省用默认库 ``vectors``）。
+    """
+
+    name: str = Field(description="提供者唯一名称（作为向量库映射键）")
+    backend: str = Field(default="local", description="local | cloud")
+    local: EmbeddingLocalConfig = Field(
+        default_factory=EmbeddingLocalConfig, description="本地后端参数"
+    )
+    cloud: EmbeddingCloudConfig = Field(
+        default_factory=EmbeddingCloudConfig, description="云端后端参数"
+    )
+    vector_store: str | None = Field(default=None, description="使用的向量库名称；null 用默认库")
+    priority: int = Field(default=1, description="优先级，数字越小越优先")
 
 
 class EmbeddingConfig(_BaseConfig):
-    """Embedding 双后端总配置。"""
+    """Embedding 双后端总配置（兼容旧单后端，支持多 provider + 多向量库 + 熔断）。"""
 
     backend: str = Field(default="local", description="local（默认）| cloud")
     local: EmbeddingLocalConfig = Field(
@@ -93,10 +147,38 @@ class EmbeddingConfig(_BaseConfig):
     cloud: EmbeddingCloudConfig = Field(
         default_factory=EmbeddingCloudConfig, description="云端后端"
     )
+    providers: list[EmbeddingProviderConfig] = Field(
+        default_factory=list,
+        description="多提供者列表；为空时用 backend/local/cloud 兼容单后端",
+    )
+    active_provider: str | None = Field(
+        default=None, description="手动指定首选 provider 名称（providers 非空时生效）"
+    )
+    failover: FailoverConfig = Field(
+        default_factory=FailoverConfig, description="多提供者失败切换/熔断参数"
+    )
+    vector_stores: list[VectorStoreConfig] = Field(
+        default_factory=list,
+        description="向量库列表（name + path）；provider 通过 vector_store 名称映射",
+    )
+
+
+class LLMProviderConfig(_BaseConfig):
+    """LLM 提供者（渠道/模型）配置（PRD v0.4.0 M1）。"""
+
+    name: str = Field(description="提供者唯一名称（用于手动指定/日志/状态）")
+    base_url: str = Field(default="https://api.openai.com/v1", description="OpenAI 兼容服务地址")
+    model: str = Field(default="gpt-4o-mini", description="模型名")
+    api_key_env: str | None = Field(
+        default=None, description="Key 所在环境变量名；null 时认 SAFEFUSION_LLM_API_KEY"
+    )
+    timeout: float = Field(default=3.0, description="单次调用超时（秒）")
+    max_retry: int = Field(default=1, description="JSON 输出解析失败重试次数")
+    priority: int = Field(default=1, description="优先级，数字越小越优先")
 
 
 class LLMConfig(_BaseConfig):
-    """LLM 兜底配置（OpenAI 兼容）。"""
+    """LLM 兜底配置（OpenAI 兼容；支持多 provider + 失败切换）。"""
 
     base_url: str = Field(default="https://api.openai.com/v1", description="OpenAI 兼容服务地址")
     model: str = Field(default="gpt-4o-mini", description="兜底模型名")
@@ -107,6 +189,16 @@ class LLMConfig(_BaseConfig):
     max_retry: int = Field(default=1, description="JSON 输出解析失败重试次数")
     short_text_max_length: int = Field(default=20, description="短文本 LLM 缓存判定的文本长度上限")
     api_key: str | None = Field(default=None, description="LLM Key（仅从环境变量解析）")
+    providers: list[LLMProviderConfig] = Field(
+        default_factory=list,
+        description="多提供者列表；为空时用上方旧单后端兼容模式",
+    )
+    active_provider: str | None = Field(
+        default=None, description="手动指定首选 provider 名称（providers 非空时生效）"
+    )
+    failover: FailoverConfig = Field(
+        default_factory=FailoverConfig, description="多提供者失败切换/熔断参数"
+    )
 
 
 class CacheItemConfig(_BaseConfig):
@@ -180,6 +272,46 @@ class KeywordConfig(_BaseConfig):
     )
 
 
+class RerankProviderConfig(_BaseConfig):
+    """Rerank 提供者（本地 CLIP 或远程 API）配置（PRD v0.4.0 M2）。"""
+
+    name: str = Field(description="提供者唯一名称（用于手动指定/日志/状态）")
+    type: str = Field(default="local", description="local（本地 CLIP 二次编码）| cloud（远程 API）")
+    base_url: str | None = Field(
+        default=None, description="远程 ReRanker API base_url（cloud 必填）"
+    )
+    model: str | None = Field(default=None, description="远程模型名（cloud 必填）")
+    api_key_env: str | None = Field(
+        default=None,
+        description="远程 Key 环境变量名；null 时认 SAFEFUSION_RERANK_API_KEY",
+    )
+    allow_no_key: bool = Field(
+        default=False,
+        description="本地无鉴权 Rerank 服务允许无 Key；默认 False 强制 Key",
+    )
+    timeout: float = Field(default=10.0, description="远程调用超时（秒）")
+    priority: int = Field(default=1, description="优先级，数字越小越优先")
+
+
+class RerankConfig(_BaseConfig):
+    """Rerank 多提供者配置（PRD v0.4.0 M2/M3）。
+
+    开关仍由 ``semantic.rerank_enabled`` 控制；本分组只承载 providers /
+    active_provider / failover。providers 为空时回退旧 ``LocalClipRerank``。
+    """
+
+    providers: list[RerankProviderConfig] = Field(
+        default_factory=list,
+        description="多提供者列表；为空且 rerank_enabled=true 时回退本地 CLIP 重排",
+    )
+    active_provider: str | None = Field(
+        default=None, description="手动指定首选 provider 名称（providers 非空时生效）"
+    )
+    failover: FailoverConfig = Field(
+        default_factory=FailoverConfig, description="多提供者失败切换/熔断参数"
+    )
+
+
 class SemanticConfig(_BaseConfig):
     """语义层扩展配置（v0.2 新增 Rerank 四信号；v0.2.1 新增 fuse_mode）。"""
 
@@ -243,6 +375,9 @@ class AppConfig(_BaseConfig):
     )
     semantic: SemanticConfig = Field(
         default_factory=SemanticConfig, description="语义层（Rerank 四信号）"
+    )
+    rerank: RerankConfig = Field(
+        default_factory=RerankConfig, description="Rerank 多提供者（PRD v0.4.0 M2）"
     )
     review: ReviewConfig = Field(default_factory=ReviewConfig, description="定时复核")
 

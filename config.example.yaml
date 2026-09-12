@@ -27,8 +27,11 @@ thresholds:
   confidence_high: 0.75          # 置信度高档下界：高于此值判定违规
   phash_whitelist_distance: 5    # 图片白名单 pHash 汉明距离阈值
   phash_dedup_distance: 3        # 图片去重缓存近似命中 pHash 阈值
+  top_k: 5                       # 语义检索 Top-K（黑/白库默认召回数）
+  black_top_k: null              # 黑库独立 Top-K；null 跟随 top_k
+  white_top_k: null              # 白库独立 Top-K；null 跟随 top_k
 
-# ---- Embedding（双后端：本地 Chinese-CLIP 默认 / 云端 API 可配）----
+# ---- Embedding（双后端：本地 Chinese-CLIP 默认 / 云端 API 可配；支持多 provider + 多向量库）----
 embedding:
   backend: "local"               # local | cloud
   local:
@@ -40,8 +43,47 @@ embedding:
     model: null                  # 云端 embedding 模型名
     api_key_env: null            # 云端 Key 所在环境变量名；null 时仅认 SAFEFUSION_EMBEDDING_API_KEY
     allow_no_key: false          # 本地无鉴权服务（llama.cpp --embeddings）可置 true 免 Key
+    image_protocol: "openai"     # openai（默认，/v1/embeddings+input+data URI）| llamacpp（llama.cpp 多模态专用 /embeddings+content+multimodal_data）
+    image_max_side: 1024         # 云端图片发送前最长边缩放上限（px）；0 不缩放
+    image_quality: 85            # 云端图片 JPEG 压缩质量（1~95）
+  # 多提供者（可选；providers 为空时使用上方 backend/local/cloud 单后端）
+  providers: []
+  # 手动指定首选 provider 名称（providers 非空时生效）
+  active_provider: null
+  # 多提供者失败切换/熔断参数（PRD v0.4.0 M3）
+  failover:
+    enabled: true
+    cooldown_seconds: 30
+    max_failures: 3
+  # 多向量库映射：每个向量库有唯一 name + 相对 data_dir 的目录。
+  # provider 通过 vector_store 字段指定使用哪个库；未指定则用默认库 data/vectors。
+  # 注意：启动只登记路径，按需懒加载，不会一次性把所有大库读进内存。
+  vector_stores:
+    # - name: "wemm"
+    #   path: "vectors/wemm"
+    # - name: "clip"
+    #   path: "vectors/clip"
+  # provider 示例（每个 provider 可指定 vector_store）：
+  # providers:
+  #   - name: "local-clip"
+  #     backend: "local"
+  #     local:
+  #       model_name: "OFA-Sys/chinese-clip-vit-base-patch16"
+  #       device: "auto"
+  #     vector_store: "clip"
+  #     priority: 1
+  #   - name: "cloud-wemm"
+  #     backend: "cloud"
+  #     cloud:
+  #       base_url: "http://127.0.0.1:5546/v1"
+  #       model: "WeMM-Embedding-2B-Q4_K_M.gguf"
+  #       allow_no_key: true
+  #       image_protocol: "llamacpp"
+  #       image_max_side: 1024
+  #     vector_store: "wemm"
+  #     priority: 2
 
-# ---- LLM 兜底（OpenAI 兼容）----
+# ---- LLM 兜底（OpenAI 兼容；支持多 provider + 失败切换）----
 llm:
   base_url: "https://api.openai.com/v1"   # OpenAI 兼容服务地址
   model: "gpt-4o-mini"                    # 兜底模型名
@@ -49,6 +91,34 @@ llm:
   timeout: 3                              # 单次调用超时（秒，PRD §3.5）
   max_retry: 1                            # JSON 输出解析失败重试次数
   short_text_max_length: 20               # 短文本 LLM 缓存判定的文本长度上限
+  # 多提供者（可选；providers 为空时使用上方单后端兼容模式）
+  providers: []
+  active_provider: null                   # 手动指定首选 provider 名称
+  failover:
+    enabled: true
+    cooldown_seconds: 30
+    max_failures: 3
+
+# ---- Rerank 多提供者（PRD v0.4.0 M2；开关在 semantic.rerank_enabled）----
+# providers 为空且 semantic.rerank_enabled=true 时，回退现有 LocalClipRerank。
+rerank:
+  providers: []
+  active_provider: null
+  failover:
+    enabled: true
+    cooldown_seconds: 30
+    max_failures: 3
+  # provider 示例：
+  # providers:
+  #   - name: "local-clip"
+  #     type: "local"
+  #     priority: 1
+  #   - name: "cloud-jina"
+  #     type: "cloud"
+  #     base_url: "https://api.example.com/v1"
+  #     model: "jina-reranker-v2-base-multilingual"
+  #     api_key_env: "JINA_API_KEY"
+  #     priority: 2
 
 # ---- 缓存层（五级，全部进程内；容量 = 最大条目数，ttl = 秒）----
 cache:
